@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: sipchat-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 7d
+      - key: ALLOWED_ORIGINS
+        value: ""
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sipchat-db
+          property: connectionString
+
+databases:
+  - name: sipchat-db
+    plan: free
