@@ -45,11 +45,21 @@ function attachSockets(io) {
         const isMember = await assertMember(chatId, socket.userId);
         if (!isMember) return ack?.({ ok: false, error: 'forbidden' });
 
-        const result = await pool.query(
+        const inserted = await pool.query(
           `INSERT INTO messages (chat_id, sender_id, type, text)
            VALUES ($1, $2, 'TEXT', $3)
-           RETURNING id, chat_id, sender_id, type, text, created_at`,
+           RETURNING id`,
           [chatId, socket.userId, text],
+        );
+
+        const result = await pool.query(
+          `SELECT m.id, m.chat_id, m.sender_id, m.type, m.text, m.created_at,
+                  u.handle AS sender_handle, u.display_name AS sender_display_name,
+                  u.avatar_url AS sender_avatar_url
+             FROM messages m
+             JOIN users u ON u.id = m.sender_id
+            WHERE m.id = $1`,
+          [inserted.rows[0].id],
         );
         const message = result.rows[0];
 

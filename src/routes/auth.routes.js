@@ -105,4 +105,22 @@ function toPublicUser(row) {
   };
 }
 
+// GET /api/auth/me — returns the authenticated caller's own profile.
+// Kept in this file (rather than chats.routes.js) since it's identity, not
+// chat, data; mounted below at the bottom of the file.
+const { requireAuth } = require('../middleware/auth');
+router.get('/me', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, handle, display_name, avatar_url FROM users WHERE id = $1',
+      [req.user.id],
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Kullanıcı bulunamadı.' });
+    res.json({ user: toPublicUser(result.rows[0]) });
+  } catch (err) {
+    console.error('me error', err);
+    res.status(500).json({ error: 'Profil getirilemedi.' });
+  }
+});
+
 module.exports = router;
