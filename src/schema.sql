@@ -35,5 +35,31 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Bu üç sütun sonradan eklendi (medya desteği). Tablo daha önce
+-- oluşturulmuş bir dağıtımda da güvenle tekrar çalıştırılabilsin diye
+-- ALTER ... IF NOT EXISTS kullanılıyor.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_data BYTEA;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_mime TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_filename TEXT;
+
+-- Her kullanıcının uçtan uca şifreleme için genel anahtarı (Tink hibrit
+-- şifreleme keyset'i, base64). Sadece DIRECT sohbetlerde kullanılır — bkz.
+-- Android tarafındaki E2eKeyManager.kt.
+CREATE TABLE IF NOT EXISTS user_keys (
+    user_id       UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    public_key    TEXT NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Push bildirimleri için cihaz FCM token'ları. Bir kullanıcının birden
+-- fazla cihazı olabileceğinden user_id başına çoklu satır.
+CREATE TABLE IF NOT EXISTS push_tokens (
+    token         TEXT PRIMARY KEY,
+    user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    platform      TEXT NOT NULL DEFAULT 'android',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_members_user_id ON chat_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_push_tokens_user_id ON push_tokens(user_id);

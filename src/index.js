@@ -9,6 +9,9 @@ const { Server } = require('socket.io');
 
 const authRoutes = require('./routes/auth.routes');
 const chatsRoutes = require('./routes/chats.routes');
+const mediaRoutes = require('./routes/media.routes');
+const usersRoutes = require('./routes/users.routes');
+const pushRoutes = require('./routes/push.routes');
 const { attachSockets } = require('./sockets');
 
 const app = express();
@@ -49,6 +52,9 @@ app.use(
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 app.use('/api/auth', authRoutes);
 app.use('/api/chats', chatsRoutes);
+app.use('/api/media', mediaRoutes);
+app.use('/api/users', usersRoutes);
+app.use('/api/push', pushRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
