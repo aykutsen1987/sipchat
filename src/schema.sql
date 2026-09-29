@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS chat_members (
     PRIMARY KEY (chat_id, user_id)
 );
 
+-- Okundu bilgisi / okunmamış sayısı için: kullanıcının bu sohbette en son
+-- ne zaman "okuduğu". Mevcut üyeler için varsayılan now() = hepsi okunmuş.
+ALTER TABLE chat_members ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
 CREATE TABLE IF NOT EXISTS messages (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     chat_id       UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,

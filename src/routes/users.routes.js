@@ -1,5 +1,5 @@
 const express = require('express');
-const { body, param, validationResult } = require('express-validator');
+const { body, query, validationResult } = require('express-validator');
 const { pool } = require('../db');
 const { requireAuth } = require('../middleware/auth');
 
@@ -31,6 +31,28 @@ router.put(
     }
   },
 );
+
+// GET /api/users/search?q=... — find people to start a chat with (handle or
+// display name, min 2 chars, never returns myself).
+router.get('/search', [query('q').isString().trim().isLength({ min: 2, max: 40 })], async (req, res) => {
+  if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'En az 2 karakter girin.' });
+  try {
+    const escaped = req.query.q.trim().replace(/[\\%_]/g, (c) => '\\' + c);
+    const pattern = '%' + escaped + '%';
+    const r = await pool.query(
+      `SELECT id, handle, display_name, avatar_url FROM users
+        WHERE id != $1 AND (handle ILIKE $2 OR display_name ILIKE $2)
+        ORDER BY handle LIMIT 20`,
+      [req.user.id, pattern],
+    );
+    res.json({
+      users: r.rows.map((u) => ({ id: u.id, handle: u.handle, displayName: u.display_name, avatarUrl: u.avatar_url })),
+    });
+  } catch (err) {
+    console.error('user search error', err);
+    res.status(500).json({ error: 'Arama başarısız.' });
+  }
+});
 
 module.exports = router;
 
