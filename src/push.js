@@ -1,4 +1,4 @@
-const { pool } = require('../db');
+const { pool } = require('./db');
 
 let admin = null;
 let initialized = false;
