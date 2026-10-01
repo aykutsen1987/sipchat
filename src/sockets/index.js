@@ -2,7 +2,7 @@ const { verifyToken } = require('../utils/jwt');
 const { pool } = require('../db');
 const { sendPushToUser } = require('../push');
 const {
-  memberIds, isOnline, emitToMembers, contactIds, selectEnrichedMessage,
+  memberIds, isOnline, emitToMembers, contactIds, isChatBlocked, selectEnrichedMessage,
 } = require('../realtime');
 
 /**
@@ -43,6 +43,7 @@ function attachSockets(io) {
           return ack?.({ ok: false, error: 'invalid payload' });
         }
         if (!(await assertMember(chatId, socket.userId))) return ack?.({ ok: false, error: 'forbidden' });
+        if (await isChatBlocked(chatId, socket.userId)) return ack?.({ ok: false, error: 'blocked' });
 
         const inserted = await pool.query(
           `INSERT INTO messages (chat_id, sender_id, type, text) VALUES ($1, $2, 'TEXT', $3) RETURNING id`,
@@ -62,6 +63,7 @@ function attachSockets(io) {
     socket.on('call:invite', async ({ chatId, targetUserId, callType, sdpOffer }) => {
       if (!(await assertMember(chatId, socket.userId))) return;
       if (!(await assertMember(chatId, targetUserId))) return;
+      if (await isChatBlocked(chatId, socket.userId)) return;
       io.to(`user:${targetUserId}`).emit('call:invite', {
         chatId, fromUserId: socket.userId, fromHandle: socket.userHandle, callType, sdpOffer,
       });

@@ -66,4 +66,14 @@ CREATE TABLE IF NOT EXISTS push_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_members_user_id ON chat_members(user_id);
+-- Kullanıcı engelleme. blocker_id, blocked_id ile mesajlaşamaz (tek yönlü
+-- de olsa iki yönlü de kontrol edilir — bkz. realtime.js#isBlocked).
+CREATE TABLE IF NOT EXISTS blocked_users (
+    blocker_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    blocked_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (blocker_id, blocked_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_blocked_users_blocked_id ON blocked_users(blocked_id);
 CREATE INDEX IF NOT EXISTS idx_push_tokens_user_id ON push_tokens(user_id);

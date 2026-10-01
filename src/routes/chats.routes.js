@@ -5,14 +5,17 @@ const { pool } = require('../db');
 const { requireAuth } = require('../middleware/auth');
 const { notifyOtherMembers } = require('../sockets');
 const {
-  isOnline, emitToMembers, MESSAGE_SELECT, selectEnrichedMessage,
+  isOnline, emitToMembers, isBlocked, isChatBlocked, MESSAGE_SELECT, selectEnrichedMessage,
 } = require('../realtime');
 
 const router = express.Router();
 router.use(requireAuth);
 
-// 8 MB, held in memory just long enough to insert into Postgres as bytea.
-const MAX_MEDIA_BYTES = 8 * 1024 * 1024;
+// 20 MB cap (kept in memory only long enough to insert into Postgres as
+// bytea) — enough for a short video clip. See backend README's "Medya
+// Gönderimi" section for why this is fine on Render's free Postgres for a
+// demo/MVP but not for real scale.
+const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_MEDIA_BYTES } });
 
 const invalid = (req) => !validationResult(req).isEmpty();
@@ -83,6 +86,9 @@ router.post(
       if (type === 'DIRECT') {
         if (!req.body.userId || req.body.userId === me) {
           return res.status(400).json({ error: 'Geçerli bir kullanıcı seçin.' });
+        }
+        if (await isBlocked(me, req.body.userId)) {
+          return res.status(403).json({ error: 'Bu kullanıcıyla sohbet başlatılamıyor.' });
         }
         others = [req.body.userId];
         const existing = await client.query(
@@ -155,6 +161,7 @@ router.post(
     const { chatId } = req.params;
     try {
       if (!(await assertMember(chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
+      if (await isChatBlocked(chatId, req.user.id)) return res.status(403).json({ error: 'Bu kişiyle mesajlaşamazsınız.' });
       const inserted = await pool.query(
         `INSERT INTO messages (chat_id, sender_id, type, text) VALUES ($1, $2, 'TEXT', $3) RETURNING id`,
         [chatId, req.user.id, req.body.text],
@@ -180,9 +187,12 @@ router.post('/:chatId/media', [param('chatId').isUUID()], upload.single('file'),
   const { chatId } = req.params;
   try {
     if (!(await assertMember(chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
+    if (await isChatBlocked(chatId, req.user.id)) return res.status(403).json({ error: 'Bu kişiyle mesajlaşamazsınız.' });
 
     const mime = req.file.mimetype || 'application/octet-stream';
-    const type = mime.startsWith('image/') ? 'IMAGE' : mime.startsWith('audio/') ? 'VOICE' : 'FILE';
+    const type = mime.startsWith('image/') ? 'IMAGE'
+      : mime.startsWith('video/') ? 'VIDEO'
+        : mime.startsWith('audio/') ? 'VOICE' : 'FILE';
     const duration = type === 'VOICE' && typeof req.body.duration === 'string' ? req.body.duration.slice(0, 10) : null;
 
     const inserted = await pool.query(
@@ -234,6 +244,83 @@ router.delete('/:chatId/messages/:messageId', [param('chatId').isUUID(), param('
   } catch (err) {
     console.error('delete message error', err);
     res.status(500).json({ error: 'Mesaj silinemedi.' });
+  }
+});
+
+// GET /api/chats/:chatId/members — for the group-info screen.
+router.get('/:chatId/members', [param('chatId').isUUID()], async (req, res) => {
+  if (invalid(req)) return res.status(400).json({ error: 'Geçersiz chatId.' });
+  try {
+    if (!(await assertMember(req.params.chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
+    const r = await pool.query(
+      `SELECT u.id, u.handle, u.display_name, u.avatar_url
+         FROM chat_members cm JOIN users u ON u.id = cm.user_id
+        WHERE cm.chat_id = $1
+        ORDER BY cm.joined_at`,
+      [req.params.chatId],
+    );
+    res.json({
+      members: r.rows.map((u) => ({ id: u.id, handle: u.handle, displayName: u.display_name, avatarUrl: u.avatar_url })),
+    });
+  } catch (err) {
+    console.error('get members error', err);
+    res.status(500).json({ error: 'Üyeler getirilemedi.' });
+  }
+});
+
+// POST /api/chats/:chatId/members — add people to a GROUP. Any current
+// member can invite others (no admin-only restriction in this MVP).
+router.post(
+  '/:chatId/members',
+  [param('chatId').isUUID(), body('memberIds').isArray({ min: 1, max: 50 }), body('memberIds.*').isUUID()],
+  async (req, res) => {
+    if (invalid(req)) return res.status(400).json({ error: 'Geçersiz istek.' });
+    const { chatId } = req.params;
+    try {
+      if (!(await assertMember(chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
+      const chat = await pool.query('SELECT kind FROM chats WHERE id = $1', [chatId]);
+      if (chat.rows.length === 0) return res.status(404).json({ error: 'Sohbet bulunamadı.' });
+      if (chat.rows[0].kind !== 'GROUP') return res.status(400).json({ error: 'Yalnızca gruplara üye eklenebilir.' });
+
+      const newIds = [...new Set(req.body.memberIds)];
+      const found = await pool.query('SELECT id FROM users WHERE id = ANY($1)', [newIds]);
+      if (found.rows.length !== newIds.length) return res.status(404).json({ error: 'Kullanıcı bulunamadı.' });
+
+      await pool.query(
+        `INSERT INTO chat_members (chat_id, user_id) SELECT $1, unnest($2::uuid[]) ON CONFLICT DO NOTHING`,
+        [chatId, newIds],
+      );
+      const io = req.app.get('io');
+      await emitToMembers(io, chatId, 'chat:members-changed', { chatId });
+      newIds.forEach((id) => io?.to(`user:${id}`).emit('chat:created', { chatId }));
+      res.status(204).send();
+    } catch (err) {
+      console.error('add members error', err);
+      res.status(500).json({ error: 'Üye eklenemedi.' });
+    }
+  },
+);
+
+// DELETE /api/chats/:chatId/members/me — leave a group. (Leaving, not
+// removing others — no admin roles in this MVP; see README limitations.)
+router.delete('/:chatId/members/me', [param('chatId').isUUID()], async (req, res) => {
+  if (invalid(req)) return res.status(400).json({ error: 'Geçersiz chatId.' });
+  const { chatId } = req.params;
+  try {
+    const chat = await pool.query('SELECT kind FROM chats WHERE id = $1', [chatId]);
+    if (chat.rows.length === 0) return res.status(404).json({ error: 'Sohbet bulunamadı.' });
+    if (chat.rows[0].kind !== 'GROUP') return res.status(400).json({ error: 'Yalnızca gruplardan ayrılabilirsiniz.' });
+
+    const r = await pool.query('DELETE FROM chat_members WHERE chat_id = $1 AND user_id = $2', [chatId, req.user.id]);
+    if (r.rowCount === 0) return res.status(403).json({ error: 'Bu sohbete zaten üye değilsiniz.' });
+
+    const io = req.app.get('io');
+    await emitToMembers(io, chatId, 'chat:members-changed', { chatId });
+    io?.to(`user:${req.user.id}`).emit('chat:left', { chatId });
+    res.status(204).send();
+  } catch (err) {
+    console.error('leave group error', err);
+    res.status(500).json({ error: 'Gruptan ayrılınamadı.' });
   }
 });
 

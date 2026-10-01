@@ -33,6 +33,28 @@ async function contactIds(userId) {
   return r.rows.map((x) => x.user_id);
 }
 
+/** True if EITHER user has blocked the other — blocking is always mutual in effect. */
+async function isBlocked(userIdA, userIdB) {
+  const r = await pool.query(
+    `SELECT 1 FROM blocked_users
+      WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)`,
+    [userIdA, userIdB],
+  );
+  return r.rows.length > 0;
+}
+
+/** For a DIRECT chat, true if either participant has blocked the other. */
+async function isChatBlocked(chatId, userId) {
+  const r = await pool.query(
+    `SELECT cm.user_id FROM chat_members cm
+       JOIN chats c ON c.id = cm.chat_id
+      WHERE cm.chat_id = $1 AND c.kind = 'DIRECT' AND cm.user_id != $2`,
+    [chatId, userId],
+  );
+  if (r.rows.length === 0) return false; // GROUP chats are never blocked
+  return isBlocked(userId, r.rows[0].user_id);
+}
+
 const MESSAGE_SELECT = `
   SELECT m.id, m.chat_id, m.sender_id, m.type, m.text, m.created_at,
          (m.media_data IS NOT NULL) AS has_media, m.media_mime, m.media_filename,
@@ -52,4 +74,6 @@ async function selectEnrichedMessage(messageId) {
   return r.rows[0];
 }
 
-module.exports = { memberIds, isOnline, emitToMembers, contactIds, MESSAGE_SELECT, selectEnrichedMessage };
+module.exports = {
+  memberIds, isOnline, emitToMembers, contactIds, isBlocked, isChatBlocked, MESSAGE_SELECT, selectEnrichedMessage,
+};
