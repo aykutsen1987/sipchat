@@ -2,7 +2,7 @@ const { verifyToken } = require('../utils/jwt');
 const { pool } = require('../db');
 const { sendPushToUser } = require('../push');
 const {
-  memberIds, isOnline, emitToMembers, contactIds, isChatBlocked, selectEnrichedMessage,
+  memberIds, isOnline, emitToMembers, contactIds, isChatBlocked, getShowLastSeen, selectEnrichedMessage,
 } = require('../realtime');
 
 /**
@@ -18,6 +18,7 @@ function attachSockets(io) {
       const payload = verifyToken(token);
       socket.userId = payload.sub;
       socket.userHandle = payload.handle;
+      socket.sessionId = payload.sid || null;
       return next();
     } catch (err) {
       return next(new Error('unauthorized'));
@@ -30,6 +31,9 @@ function attachSockets(io) {
     const wasOnline = isOnline(io, socket.userId);
     socket.join(`user:${socket.userId}`);
     if (!wasOnline) broadcastPresence(io, socket.userId, true);
+    if (socket.sessionId) {
+      pool.query('UPDATE sessions SET last_seen_at = now() WHERE id = $1', [socket.sessionId]).catch(() => {});
+    }
 
     // Kept for older clients; live delivery now goes through the personal
     // `user:<id>` room, so joining chat rooms is no longer required.
@@ -90,6 +94,9 @@ function attachSockets(io) {
 
 async function broadcastPresence(io, userId, online) {
   try {
+    // Real privacy enforcement, not just a UI label: if the user turned
+    // this off, no presence event leaves the server for them at all.
+    if (!(await getShowLastSeen(userId))) return;
     const ids = await contactIds(userId);
     ids.forEach((id) => io.to(`user:${id}`).emit('presence:update', { userId, online }));
   } catch (err) {
@@ -107,17 +114,61 @@ async function notifyOtherMembers(io, chatId, senderId, message) {
   try {
     const sender = await pool.query('SELECT display_name FROM users WHERE id = $1', [senderId]);
     const senderName = sender.rows[0]?.display_name || 'SipChat';
-    const body = message.type === 'TEXT'
+    const fullBody = message.type === 'TEXT'
       // E2E payloads are ciphertext the server can't read — don't leak them into a notification.
       ? (String(message.text || '').startsWith('sipchat-e2e-v1:') ? 'Yeni şifreli mesaj' : String(message.text || '').slice(0, 120))
       : message.type === 'VOICE' ? 'Sesli mesaj gönderdi'
-        : message.type === 'IMAGE' ? 'Fotoğraf gönderdi' : 'Dosya gönderdi';
+        : message.type === 'IMAGE' ? 'Fotoğraf gönderdi'
+          : message.type === 'VIDEO' ? 'Video gönderdi' : 'Dosya gönderdi';
 
     const ids = (await memberIds(chatId)).filter((id) => id !== senderId && !isOnline(io, id));
-    await Promise.all(ids.map((id) => sendPushToUser(id, { title: senderName, body })));
+    if (ids.length === 0) return;
+
+    // "Mesaj Önizlemeleri" is each RECIPIENT's own lock-screen privacy
+    // choice, so it's looked up per-recipient, not per-sender.
+    const settings = await pool.query(
+      'SELECT user_id, message_previews_enabled FROM user_settings WHERE user_id = ANY($1)',
+      [ids],
+    );
+    const previewEnabled = new Map(settings.rows.map((r) => [r.user_id, r.message_previews_enabled]));
+
+    await Promise.all(ids.map((id) => {
+      const showPreview = previewEnabled.get(id) ?? true;
+      return sendPushToUser(id, {
+        title: showPreview ? senderName : 'SipChat',
+        body: showPreview ? fullBody : 'Yeni bir mesajınız var',
+      });
+    }));
   } catch (err) {
     console.error('notifyOtherMembers error (non-fatal)', err);
   }
 }
 
-module.exports = { attachSockets, notifyOtherMembers };
+/**
+ * "Kaybolan Mesajlar": sweeps every chat with a non-null disappear_seconds
+ * and deletes messages older than that, notifying any connected members so
+ * their UI drops the message live (not just on next refresh). Call once
+ * after the server starts; it re-checks every [intervalMs].
+ */
+function startDisappearingMessagesSweep(io, intervalMs = 60_000) {
+  const sweep = async () => {
+    try {
+      const result = await pool.query(
+        `DELETE FROM messages m USING chats c
+          WHERE m.chat_id = c.id AND c.disappear_seconds IS NOT NULL
+            AND m.created_at < now() - (c.disappear_seconds || ' seconds')::interval
+         RETURNING m.id, m.chat_id`,
+      );
+      for (const row of result.rows) {
+        // eslint-disable-next-line no-await-in-loop
+        await emitToMembers(io, row.chat_id, 'message:deleted', { chatId: row.chat_id, messageId: row.id });
+      }
+    } catch (err) {
+      console.error('disappearing messages sweep error (non-fatal)', err);
+    }
+  };
+  sweep();
+  return setInterval(sweep, intervalMs);
+}
+
+module.exports = { attachSockets, notifyOtherMembers, startDisappearingMessagesSweep };

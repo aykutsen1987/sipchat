@@ -1,10 +1,23 @@
 const { verifyToken } = require('../utils/jwt');
+const { pool } = require('../db');
 
 /**
  * Protects REST routes: expects "Authorization: Bearer <token>".
- * Attaches { id, handle } to req.user on success.
+ * Attaches { id, handle } to req.user, and the session id (if present in
+ * the token) to req.sessionId, on success.
+ *
+ * Tokens carry a "sid" claim identifying their row in the `sessions` table
+ * (see "Bağlı Cihazlar" / routes/sessions.routes.js). If that session has
+ * been revoked (remote "sign out this device"), the token is rejected even
+ * though it's still cryptographically valid and unexpired — this is what
+ * makes "Bağlı Cihazlar" → revoke actually work.
+ *
+ * Tokens issued before this feature existed have no "sid" claim; those are
+ * accepted as before (fail-open) so upgrading never logs existing sessions
+ * out. A DB hiccup while checking revocation also fails open — this check
+ * must never be the reason the whole API goes down.
  */
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const [scheme, token] = header.split(' ');
 
@@ -12,13 +25,28 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Yetkilendirme gerekli (Bearer token eksik).' });
   }
 
+  let payload;
   try {
-    const payload = verifyToken(token);
-    req.user = { id: payload.sub, handle: payload.handle };
-    return next();
+    payload = verifyToken(token);
   } catch (err) {
     return res.status(401).json({ error: 'Geçersiz veya süresi dolmuş token.' });
   }
+
+  req.user = { id: payload.sub, handle: payload.handle };
+  req.sessionId = payload.sid || null;
+
+  if (payload.sid) {
+    try {
+      const result = await pool.query('SELECT revoked_at FROM sessions WHERE id = $1', [payload.sid]);
+      if (result.rows.length > 0 && result.rows[0].revoked_at) {
+        return res.status(401).json({ error: 'Bu oturum başka bir cihazdan sonlandırıldı.' });
+      }
+    } catch (err) {
+      console.error('session check error (failing open)', err);
+    }
+  }
+
+  return next();
 }
 
 module.exports = { requireAuth };

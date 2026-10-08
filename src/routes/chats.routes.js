@@ -33,6 +33,8 @@ router.get('/', async (req, res) => {
       `SELECT c.id, c.kind,
               CASE WHEN c.kind = 'DIRECT' THEN COALESCE(peer.display_name, c.title) ELSE c.title END AS title,
               peer.id AS peer_user_id,
+              COALESCE(peer_settings.show_last_seen, true) AS peer_show_last_seen,
+              c.disappear_seconds,
               m.text AS last_message_text, m.type AS last_message_type, m.created_at AS last_message_at,
               (SELECT COUNT(*) FROM messages um
                 WHERE um.chat_id = c.id AND um.sender_id != $1 AND um.created_at > cm.last_read_at)::int AS unread_count,
@@ -43,6 +45,7 @@ router.get('/', async (req, res) => {
               SELECT u.id, u.display_name FROM chat_members pm JOIN users u ON u.id = pm.user_id
                WHERE pm.chat_id = c.id AND pm.user_id != $1 AND c.kind = 'DIRECT' LIMIT 1
          ) peer ON true
+         LEFT JOIN user_settings peer_settings ON peer_settings.user_id = peer.id
          LEFT JOIN LATERAL (
               SELECT text, type, created_at FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1
          ) m ON true
@@ -53,7 +56,9 @@ router.get('/', async (req, res) => {
     const io = req.app.get('io');
     const chats = result.rows.map((row) => ({
       ...row,
-      peer_online: row.peer_user_id ? isOnline(io, row.peer_user_id) : false,
+      // Real enforcement: if the peer turned last-seen/online off, they
+      // always look offline here — same rule the socket layer applies.
+      peer_online: row.peer_user_id && row.peer_show_last_seen ? isOnline(io, row.peer_user_id) : false,
     }));
     res.json({ chats });
   } catch (err) {
@@ -112,8 +117,19 @@ router.post(
       const found = await client.query('SELECT id FROM users WHERE id = ANY($1)', [others]);
       if (found.rows.length !== others.length) return res.status(404).json({ error: 'Kullanıcı bulunamadı.' });
 
+      // "Kaybolan Mesajlar — Varsayılan" in Settings: applied to chats I
+      // start from here on, not retroactively to existing ones.
+      const defaults = await client.query(
+        'SELECT disappearing_default_seconds FROM user_settings WHERE user_id = $1',
+        [me],
+      );
+      const disappearSeconds = defaults.rows[0]?.disappearing_default_seconds ?? null;
+
       await client.query('BEGIN');
-      const chat = await client.query('INSERT INTO chats (kind, title) VALUES ($1, $2) RETURNING id', [type, title]);
+      const chat = await client.query(
+        'INSERT INTO chats (kind, title, disappear_seconds) VALUES ($1, $2, $3) RETURNING id',
+        [type, title, disappearSeconds],
+      );
       const chatId = chat.rows[0].id;
       await client.query(
         'INSERT INTO chat_members (chat_id, user_id) SELECT $1, unnest($2::uuid[])',

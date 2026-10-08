@@ -43,6 +43,12 @@ async function isBlocked(userIdA, userIdB) {
   return r.rows.length > 0;
 }
 
+/** The "Son Görülme & Çevrimiçi Durumu Göster" toggle — real, enforced server-side. */
+async function getShowLastSeen(userId) {
+  const r = await pool.query('SELECT show_last_seen FROM user_settings WHERE user_id = $1', [userId]);
+  return r.rows[0]?.show_last_seen ?? true;
+}
+
 /** For a DIRECT chat, true if either participant has blocked the other. */
 async function isChatBlocked(chatId, userId) {
   const r = await pool.query(
@@ -61,8 +67,12 @@ const MESSAGE_SELECT = `
          octet_length(m.media_data) AS media_size,
          EXISTS (
            SELECT 1 FROM chat_members cm
+            JOIN user_settings cs ON cs.user_id = cm.user_id
             WHERE cm.chat_id = m.chat_id AND cm.user_id != m.sender_id
               AND cm.last_read_at >= m.created_at
+              -- Real privacy enforcement: a reader who disabled read
+              -- receipts never shows up as having read anyone's messages.
+              AND cs.read_receipts_enabled = true
          ) AS read_by_peer,
          u.handle AS sender_handle, u.display_name AS sender_display_name,
          u.avatar_url AS sender_avatar_url
@@ -75,5 +85,6 @@ async function selectEnrichedMessage(messageId) {
 }
 
 module.exports = {
-  memberIds, isOnline, emitToMembers, contactIds, isBlocked, isChatBlocked, MESSAGE_SELECT, selectEnrichedMessage,
+  memberIds, isOnline, emitToMembers, contactIds, isBlocked, isChatBlocked, getShowLastSeen,
+  MESSAGE_SELECT, selectEnrichedMessage,
 };

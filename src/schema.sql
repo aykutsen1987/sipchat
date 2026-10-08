@@ -77,3 +77,33 @@ CREATE TABLE IF NOT EXISTS blocked_users (
 
 CREATE INDEX IF NOT EXISTS idx_blocked_users_blocked_id ON blocked_users(blocked_id);
 CREATE INDEX IF NOT EXISTS idx_push_tokens_user_id ON push_tokens(user_id);
+
+-- Gerçek, işlevsel kullanıcı tercihleri (Ayarlar ekranındaki anahtarlar).
+-- Her kullanıcı kayıt olurken bir satır alır (bkz. auth.routes.js#register),
+-- bu yüzden sorgularda her zaman var olduğu varsayılabilir.
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id                       UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    read_receipts_enabled         BOOLEAN NOT NULL DEFAULT true,
+    show_last_seen                BOOLEAN NOT NULL DEFAULT true,
+    message_previews_enabled      BOOLEAN NOT NULL DEFAULT true,
+    disappearing_default_seconds  INTEGER,
+    two_factor_enabled            BOOLEAN NOT NULL DEFAULT false,
+    two_factor_secret             TEXT,
+    updated_at                    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- "Bağlı Cihazlar" ekranı için gerçek oturum takibi. JWT'ye gömülen "sid"
+-- claim'i buradaki id ile eşleşir; bir satır revoked_at alırsa o token
+-- requireAuth middleware'inde reddedilir (bkz. middleware/auth.js).
+CREATE TABLE IF NOT EXISTS sessions (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_name   TEXT NOT NULL DEFAULT 'Bilinmeyen cihaz',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+
+-- Kaybolan mesajlar: sohbet bazlı, saniye cinsinden ömür. NULL = kapalı.
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS disappear_seconds INTEGER;

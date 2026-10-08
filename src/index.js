@@ -12,7 +12,9 @@ const chatsRoutes = require('./routes/chats.routes');
 const mediaRoutes = require('./routes/media.routes');
 const usersRoutes = require('./routes/users.routes');
 const pushRoutes = require('./routes/push.routes');
-const { attachSockets } = require('./sockets');
+const sessionsRoutes = require('./routes/sessions.routes');
+const settingsRoutes = require('./routes/settings.routes');
+const { attachSockets, startDisappearingMessagesSweep } = require('./sockets');
 
 const app = express();
 const server = http.createServer(app);
@@ -55,6 +57,8 @@ app.use('/api/chats', chatsRoutes);
 app.use('/api/media', mediaRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/push', pushRoutes);
+app.use('/api/sessions', sessionsRoutes);
+app.use('/api/settings', settingsRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
@@ -72,6 +76,7 @@ const io = new Server(server, {
 });
 app.set('io', io);
 attachSockets(io);
+startDisappearingMessagesSweep(io);
 
 const port = process.env.PORT || 3000;
 server.listen(port, () => {
