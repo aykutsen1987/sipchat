@@ -132,3 +132,12 @@ CREATE TABLE IF NOT EXISTS user_backups (
     size_bytes    INTEGER NOT NULL,
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 2FA kaba kuvvet kilidi: sunucu yeniden başlasa ya da birden fazla instance
+-- çalışsa da herkes için aynı sayacı paylaşır.
+CREATE TABLE IF NOT EXISTS two_factor_attempts (
+    user_id       UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    fail_count    INTEGER NOT NULL DEFAULT 0,
+    locked_until  TIMESTAMPTZ,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);

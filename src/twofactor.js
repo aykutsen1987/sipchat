@@ -3,27 +3,63 @@
 const { pool } = require('./db');
 const totp = require('./totp');
 
-// --- Kaba kuvvet koruması (süreç içi; tek instance'lık Render için yeterli) ---
+// --- Kaba kuvvet koruması (veritabanında; yeniden başlatmadan etkilenmez,
+// birden fazla instance arasında paylaşılır) ---
 const MAX_FAILS = 5;
-const LOCK_MS = 15 * 60 * 1000;
-const failures = new Map(); // userId -> { count, lockedUntil }
+const LOCK_MINUTES = 15;
+// Bu süredir hiç deneme yapılmadıysa eski hatalar sayılmaz.
+const FAIL_WINDOW_MINUTES = 15;
 
-function lockRemainingMs(userId) {
-  const f = failures.get(userId);
-  if (!f || !f.lockedUntil) return 0;
-  const left = f.lockedUntil - Date.now();
-  if (left <= 0) { failures.delete(userId); return 0; }
-  return left;
+/** Kilidin bitmesine kalan milisaniye (kilitli değilse 0). */
+async function lockRemainingMs(userId) {
+  const r = await pool.query(
+    `SELECT GREATEST(0, EXTRACT(EPOCH FROM (locked_until - now())) * 1000)::bigint AS ms
+       FROM two_factor_attempts WHERE user_id = $1 AND locked_until IS NOT NULL`,
+    [userId],
+  );
+  return r.rows.length ? Number(r.rows[0].ms) : 0;
 }
 
-function recordFailure(userId) {
-  const f = failures.get(userId) || { count: 0, lockedUntil: 0 };
-  f.count += 1;
-  if (f.count >= MAX_FAILS) f.lockedUntil = Date.now() + LOCK_MS;
-  failures.set(userId, f);
+/** Hatalı denemeyi atomik kaydeder; eşik aşılırsa hesabı kilitler. */
+async function recordFailure(userId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      'INSERT INTO two_factor_attempts (user_id, fail_count) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING',
+      [userId],
+    );
+    const cur = await client.query(
+      `SELECT fail_count,
+              (locked_until IS NOT NULL AND locked_until <= now()) AS lock_expired,
+              (updated_at < now() - ($2 || ' minutes')::interval) AS stale
+         FROM two_factor_attempts WHERE user_id = $1 FOR UPDATE`,
+      [userId, String(FAIL_WINDOW_MINUTES)],
+    );
+    const row = cur.rows[0];
+    const base = row.lock_expired || row.stale ? 0 : row.fail_count;
+    const count = base + 1;
+    const lock = count >= MAX_FAILS;
+    await client.query(
+      `UPDATE two_factor_attempts
+          SET fail_count = $2,
+              locked_until = CASE WHEN $3::boolean THEN now() + ($4 || ' minutes')::interval ELSE NULL END,
+              updated_at = now()
+        WHERE user_id = $1`,
+      [userId, count, lock, String(LOCK_MINUTES)],
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
-function clearFailures(userId) { failures.delete(userId); }
+async function clearFailures(userId) {
+  await pool.query('DELETE FROM two_factor_attempts WHERE user_id = $1', [userId]);
+}
 
 // --- Yedek kodlar ---
 /** Eski kodları siler, yeni kodların özetlerini yazar. Düz kodları döndürür. */
@@ -73,7 +109,7 @@ async function countRemainingBackupCodes(userId) {
  *   { ok: false, locked: boolean, retryAfterMin?: number }
  */
 async function verifySecondFactor(userId, secret, rawCode) {
-  const left = lockRemainingMs(userId);
+  const left = await lockRemainingMs(userId);
   if (left > 0) return { ok: false, locked: true, retryAfterMin: Math.ceil(left / 60000) };
 
   const code = String(rawCode || '').trim();
@@ -85,10 +121,11 @@ async function verifySecondFactor(userId, secret, rawCode) {
   }
 
   if (!via) {
-    recordFailure(userId);
-    return { ok: false, locked: lockRemainingMs(userId) > 0, retryAfterMin: Math.ceil(lockRemainingMs(userId) / 60000) };
+    await recordFailure(userId);
+    const after = await lockRemainingMs(userId);
+    return { ok: false, locked: after > 0, retryAfterMin: Math.ceil(after / 60000) };
   }
-  clearFailures(userId);
+  await clearFailures(userId);
   return { ok: true, via };
 }
 

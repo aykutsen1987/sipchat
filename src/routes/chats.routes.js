@@ -264,6 +264,32 @@ router.delete('/:chatId/messages/:messageId', [param('chatId').isUUID(), param('
   }
 });
 
+// PATCH /api/chats/:chatId/disappearing {seconds} — per-chat disappearing
+// messages timer. seconds: 0/null = off, otherwise 60 – 31 536 000. Any member
+// may change it (the timer applies to everyone in the chat). Messages already
+// older than the new window are removed by the next 60 s sweep.
+router.patch(
+  '/:chatId/disappearing',
+  [
+    param('chatId').isUUID(),
+    body('seconds').custom((v) => v === null || v === 0 || (Number.isInteger(v) && v >= 60 && v <= 31_536_000)),
+  ],
+  async (req, res) => {
+    if (invalid(req)) return res.status(400).json({ error: 'Geçersiz süre.' });
+    const { chatId } = req.params;
+    const seconds = req.body.seconds || null;
+    try {
+      if (!(await assertMember(chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
+      await pool.query('UPDATE chats SET disappear_seconds = $2 WHERE id = $1', [chatId, seconds]);
+      await emitToMembers(req.app.get('io'), chatId, 'chat:disappear-changed', { chatId, seconds });
+      res.json({ chatId, seconds });
+    } catch (err) {
+      console.error('set disappearing error', err);
+      res.status(500).json({ error: 'Süre ayarlanamadı.' });
+    }
+  },
+);
+
 // GET /api/chats/:chatId/members — for the group-info screen.
 router.get('/:chatId/members', [param('chatId').isUUID()], async (req, res) => {
   if (invalid(req)) return res.status(400).json({ error: 'Geçersiz chatId.' });
