@@ -15,6 +15,7 @@ const pushRoutes = require('./routes/push.routes');
 const sessionsRoutes = require('./routes/sessions.routes');
 const settingsRoutes = require('./routes/settings.routes');
 const backupRoutes = require('./routes/backup.routes');
+const adminRoutes = require('./routes/admin.routes');
 const { attachSockets, startDisappearingMessagesSweep } = require('./sockets');
 
 const app = express();
@@ -61,6 +62,7 @@ app.use('/api/push', pushRoutes);
 app.use('/api/sessions', sessionsRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/backup', backupRoutes);
+app.use('/api/admin', adminRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 

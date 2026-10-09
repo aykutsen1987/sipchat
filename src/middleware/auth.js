@@ -38,9 +38,19 @@ async function requireAuth(req, res, next) {
   if (payload.sid) {
     try {
       const result = await pool.query('SELECT revoked_at FROM sessions WHERE id = $1', [payload.sid]);
-      if (result.rows.length > 0 && result.rows[0].revoked_at) {
+      if (result.rows.length === 0) {
+        // Oturum satırı yok: hesap silinmiş (ör. pasif hesap temizliği) ya da oturum
+        // tamamen kaldırılmış. İmzası geçerli olsa bile token artık kabul edilmez.
+        return res.status(401).json({ error: 'Oturum bulunamadı; lütfen tekrar giriş yapın.' });
+      }
+      if (result.rows[0].revoked_at) {
         return res.status(401).json({ error: 'Bu oturum başka bir cihazdan sonlandırıldı.' });
       }
+      // "Son etkinlik" ölçümü için (pasif hesap temizliği): en fazla saatte bir yazılır.
+      pool.query(
+        "UPDATE sessions SET last_seen_at = now() WHERE id = $1 AND last_seen_at < now() - interval '1 hour'",
+        [payload.sid],
+      ).catch(() => {});
     } catch (err) {
       console.error('session check error (failing open)', err);
     }
