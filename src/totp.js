@@ -72,4 +72,38 @@ function buildOtpAuthUri(accountLabel, secret, issuer = 'SipChat') {
   return `otpauth://totp/${label}?secret=${secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
 }
 
-module.exports = { generateSecret, generateTotp, verifyTotp, buildOtpAuthUri };
+// --- Yedek kodlar (2FA kurtarma) ------------------------------------------
+// 10 karakterlik, karışması kolay karakterler (0/O, 1/I/L) çıkarılmış alfabe.
+const BACKUP_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const BACKUP_CODE_COUNT = 10;
+
+/** "ABCDE-FGHJK" biçiminde 10 karakterlik (~49 bit) rastgele kod. */
+function generateBackupCode() {
+  let raw = '';
+  for (let i = 0; i < 10; i += 1) raw += BACKUP_ALPHABET[crypto.randomInt(BACKUP_ALPHABET.length)];
+  return `${raw.slice(0, 5)}-${raw.slice(5)}`;
+}
+
+function generateBackupCodes(count = BACKUP_CODE_COUNT) {
+  return Array.from({ length: count }, generateBackupCode);
+}
+
+/** Kullanıcının yazdığı kodu normalize eder (büyük harf, tire/boşluk yok). */
+function normalizeBackupCode(input) {
+  return String(input || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function looksLikeBackupCode(input) {
+  const n = normalizeBackupCode(input);
+  return n.length === 10 && [...n].every((c) => BACKUP_ALPHABET.includes(c));
+}
+
+/** Deterministik (aranabilir) HMAC özeti; JWT_SECRET "pepper" olarak kullanılır. */
+function hashBackupCode(input) {
+  return crypto.createHmac('sha256', process.env.JWT_SECRET).update(normalizeBackupCode(input)).digest('hex');
+}
+
+module.exports = {
+  generateSecret, generateTotp, verifyTotp, buildOtpAuthUri,
+  generateBackupCodes, hashBackupCode, looksLikeBackupCode, BACKUP_CODE_COUNT,
+};

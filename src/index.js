@@ -14,6 +14,7 @@ const usersRoutes = require('./routes/users.routes');
 const pushRoutes = require('./routes/push.routes');
 const sessionsRoutes = require('./routes/sessions.routes');
 const settingsRoutes = require('./routes/settings.routes');
+const backupRoutes = require('./routes/backup.routes');
 const { attachSockets, startDisappearingMessagesSweep } = require('./sockets');
 
 const app = express();
@@ -59,11 +60,15 @@ app.use('/api/users', usersRoutes);
 app.use('/api/push', pushRoutes);
 app.use('/api/sessions', sessionsRoutes);
 app.use('/api/settings', settingsRoutes);
+app.use('/api/backup', backupRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Gönderilen veri çok büyük.' });
+  }
   console.error('Unhandled error', err);
   res.status(500).json({ error: 'Sunucu hatası.' });
 });

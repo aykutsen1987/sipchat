@@ -117,8 +117,9 @@ router.post(
       const found = await client.query('SELECT id FROM users WHERE id = ANY($1)', [others]);
       if (found.rows.length !== others.length) return res.status(404).json({ error: 'Kullanıcı bulunamadı.' });
 
-      // "Kaybolan Mesajlar — Varsayılan" in Settings: applied to chats I
-      // start from here on, not retroactively to existing ones.
+      // "Kaybolan Mesajlar — Varsayılan" in Settings: applied to every chat I
+      // start from here on. Existing chats only change when the user opts in
+      // ("applyToExistingChats" in PATCH /api/settings, see settings.routes.js).
       const defaults = await client.query(
         'SELECT disappearing_default_seconds FROM user_settings WHERE user_id = $1',
         [me],

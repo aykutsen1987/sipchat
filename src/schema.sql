@@ -107,3 +107,28 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 
 -- Kaybolan mesajlar: sohbet bazlı, saniye cinsinden ömür. NULL = kapalı.
 ALTER TABLE chats ADD COLUMN IF NOT EXISTS disappear_seconds INTEGER;
+
+-- Profil fotoğrafı: baytlar DB'de tutulur (media gibi), avatar_url bu baytları
+-- sunan GET /api/users/:id/avatar adresine işaret eder.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data BYTEA;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_mime TEXT;
+
+-- 2FA yedek kodları. Kodun kendisi saklanmaz, yalnızca HMAC özeti saklanır;
+-- bir kod kullanıldığında used_at dolar ve bir daha kabul edilmez.
+CREATE TABLE IF NOT EXISTS two_factor_backup_codes (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash     TEXT NOT NULL,
+    used_at       TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_2fa_backup_user ON two_factor_backup_codes(user_id);
+
+-- Şifreli bulut yedeği: kullanıcı başına tek slot. İçerik istemcide kullanıcının
+-- parolasından türetilen anahtarla şifrelenir; sunucu yalnızca anlamsız bayt görür.
+CREATE TABLE IF NOT EXISTS user_backups (
+    user_id       UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    data          BYTEA NOT NULL,
+    size_bytes    INTEGER NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);

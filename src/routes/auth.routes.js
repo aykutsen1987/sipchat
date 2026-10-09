@@ -5,6 +5,7 @@ const { pool } = require('../db');
 const { signToken, verifyToken } = require('../utils/jwt');
 const { requireAuth } = require('../middleware/auth');
 const totp = require('../totp');
+const twofactor = require('../twofactor');
 
 const router = express.Router();
 
@@ -136,9 +137,12 @@ router.post(
 );
 
 // POST /api/auth/2fa/verify-login — second step of login when 2FA is on.
+// "code" is either the 6-digit authenticator code OR one of the one-time
+// backup codes (XXXXX-XXXXX) — that is the recovery path for someone who
+// lost their authenticator app.
 router.post(
   '/2fa/verify-login',
-  [body('pendingToken').isString().notEmpty(), body('code').isString().isLength({ min: 6, max: 6 })],
+  [body('pendingToken').isString().notEmpty(), body('code').isString().isLength({ min: 6, max: 16 })],
   async (req, res) => {
     if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'Geçersiz istek.' });
 
@@ -162,12 +166,21 @@ router.post(
       if (result.rows.length === 0) return res.status(404).json({ error: 'Kullanıcı bulunamadı.' });
 
       const user = result.rows[0];
-      if (!totp.verifyTotp(user.two_factor_secret, req.body.code)) {
+      const check = await twofactor.verifySecondFactor(user.id, user.two_factor_secret, req.body.code);
+      if (!check.ok) {
+        if (check.locked) {
+          return res.status(429).json({ error: `Çok fazla hatalı deneme. ${check.retryAfterMin} dakika sonra tekrar deneyin.` });
+        }
         return res.status(401).json({ error: 'Kod hatalı veya süresi dolmuş.' });
       }
 
       const { token } = await createSession(user.id, user.handle, req.body.deviceName);
-      return res.json({ token, user: toPublicUser(user) });
+      const response = { token, user: toPublicUser(user) };
+      if (check.via === 'backup') {
+        response.usedBackupCode = true;
+        response.backupCodesRemaining = await twofactor.countRemainingBackupCodes(user.id);
+      }
+      return res.json(response);
     } catch (err) {
       console.error('2fa verify-login error', err);
       return res.status(500).json({ error: 'Doğrulama başarısız.' });
@@ -195,8 +208,14 @@ router.get('/me', requireAuth, async (req, res) => {
 // POST /api/auth/2fa/setup — generates (or regenerates) a pending secret and
 // returns it as both raw base32 and an otpauth:// URI (render as a QR code
 // client-side). NOT yet enabled — call /2fa/enable with a code to confirm.
+// Refused while 2FA is already on: otherwise any stolen session could quietly
+// switch protection off just by calling setup again.
 router.post('/2fa/setup', requireAuth, async (req, res) => {
   try {
+    const current = await pool.query('SELECT two_factor_enabled FROM user_settings WHERE user_id = $1', [req.user.id]);
+    if (current.rows[0]?.two_factor_enabled) {
+      return res.status(409).json({ error: 'İki aşamalı doğrulama zaten açık. Önce kapatın.' });
+    }
     const secret = totp.generateSecret();
     await pool.query(
       `INSERT INTO user_settings (user_id, two_factor_secret, two_factor_enabled)
@@ -211,40 +230,69 @@ router.post('/2fa/setup', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/auth/2fa/enable {code} — confirms the pending secret from /setup.
+// POST /api/auth/2fa/enable {code} — confirms the pending secret from /setup
+// and returns the one-time backup codes. They are shown exactly once.
 router.post('/2fa/enable', requireAuth, [body('code').isString().isLength({ min: 6, max: 6 })], async (req, res) => {
   if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'Geçersiz kod.' });
   try {
-    const result = await pool.query('SELECT two_factor_secret FROM user_settings WHERE user_id = $1', [req.user.id]);
-    const secret = result.rows[0]?.two_factor_secret;
-    if (!secret) return res.status(400).json({ error: 'Önce /2fa/setup çağrılmalı.' });
-    if (!totp.verifyTotp(secret, req.body.code)) return res.status(401).json({ error: 'Kod hatalı.' });
+    const result = await pool.query('SELECT two_factor_secret, two_factor_enabled FROM user_settings WHERE user_id = $1', [req.user.id]);
+    const row = result.rows[0];
+    if (!row?.two_factor_secret) return res.status(400).json({ error: 'Önce /2fa/setup çağrılmalı.' });
+    if (row.two_factor_enabled) return res.status(409).json({ error: 'İki aşamalı doğrulama zaten açık.' });
+    if (!totp.verifyTotp(row.two_factor_secret, req.body.code)) return res.status(401).json({ error: 'Kod hatalı.' });
 
     await pool.query('UPDATE user_settings SET two_factor_enabled = true WHERE user_id = $1', [req.user.id]);
-    res.status(204).send();
+    const backupCodes = await twofactor.replaceBackupCodes(req.user.id);
+    res.json({ backupCodes });
   } catch (err) {
     console.error('2fa enable error', err);
     res.status(500).json({ error: 'Etkinleştirilemedi.' });
   }
 });
 
-// POST /api/auth/2fa/disable {code} — requires a currently-valid code, so a
-// stolen but not-yet-TOTP-capable session can't silently turn protection off.
-router.post('/2fa/disable', requireAuth, [body('code').isString().isLength({ min: 6, max: 6 })], async (req, res) => {
+// POST /api/auth/2fa/disable {code} — requires a currently-valid TOTP code or
+// an unused backup code, so a stolen session can't silently turn protection off.
+router.post('/2fa/disable', requireAuth, [body('code').isString().isLength({ min: 6, max: 16 })], async (req, res) => {
   if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'Geçersiz kod.' });
   try {
     const result = await pool.query('SELECT two_factor_secret FROM user_settings WHERE user_id = $1', [req.user.id]);
-    const secret = result.rows[0]?.two_factor_secret;
-    if (!secret || !totp.verifyTotp(secret, req.body.code)) return res.status(401).json({ error: 'Kod hatalı.' });
+    const check = await twofactor.verifySecondFactor(req.user.id, result.rows[0]?.two_factor_secret, req.body.code);
+    if (!check.ok) {
+      if (check.locked) return res.status(429).json({ error: `Çok fazla hatalı deneme. ${check.retryAfterMin} dakika sonra tekrar deneyin.` });
+      return res.status(401).json({ error: 'Kod hatalı.' });
+    }
 
     await pool.query(
       'UPDATE user_settings SET two_factor_enabled = false, two_factor_secret = NULL WHERE user_id = $1',
       [req.user.id],
     );
+    await pool.query('DELETE FROM two_factor_backup_codes WHERE user_id = $1', [req.user.id]);
     res.status(204).send();
   } catch (err) {
     console.error('2fa disable error', err);
     res.status(500).json({ error: 'Devre dışı bırakılamadı.' });
+  }
+});
+
+// POST /api/auth/2fa/backup-codes/regenerate {code} — issues a fresh set of 10
+// backup codes (invalidating all previous ones). Needs a valid TOTP/backup code.
+router.post('/2fa/backup-codes/regenerate', requireAuth, [body('code').isString().isLength({ min: 6, max: 16 })], async (req, res) => {
+  if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'Geçersiz kod.' });
+  try {
+    const result = await pool.query('SELECT two_factor_secret, two_factor_enabled FROM user_settings WHERE user_id = $1', [req.user.id]);
+    const row = result.rows[0];
+    if (!row?.two_factor_enabled) return res.status(400).json({ error: 'İki aşamalı doğrulama açık değil.' });
+
+    const check = await twofactor.verifySecondFactor(req.user.id, row.two_factor_secret, req.body.code);
+    if (!check.ok) {
+      if (check.locked) return res.status(429).json({ error: `Çok fazla hatalı deneme. ${check.retryAfterMin} dakika sonra tekrar deneyin.` });
+      return res.status(401).json({ error: 'Kod hatalı.' });
+    }
+    const backupCodes = await twofactor.replaceBackupCodes(req.user.id);
+    res.json({ backupCodes });
+  } catch (err) {
+    console.error('2fa regenerate error', err);
+    res.status(500).json({ error: 'Yedek kodlar yenilenemedi.' });
   }
 });
 
