@@ -6,6 +6,7 @@ const { signToken, verifyToken } = require('../utils/jwt');
 const { requireAuth } = require('../middleware/auth');
 const totp = require('../totp');
 const twofactor = require('../twofactor');
+const adminOps = require('../admin');
 
 const router = express.Router();
 
@@ -204,6 +205,38 @@ router.get('/me', requireAuth, async (req, res) => {
 });
 
 // --- Two-factor authentication management (requires an existing session) ---
+
+// DELETE /api/auth/me {password, code?} — permanently deletes the caller's own
+// account (sessions, keys, memberships, their messages, backup…). Requires the
+// password, and the 2FA/backup code when 2FA is on. Wrong credentials answer 403
+// (not 401) so the app doesn't mistake it for an expired session.
+router.delete('/me', requireAuth, [body('password').isString().isLength({ min: 1, max: 200 })], async (req, res) => {
+  if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'Parola gerekli.' });
+  try {
+    const u = await pool.query(
+      `SELECT u.password_hash, s.two_factor_enabled, s.two_factor_secret
+         FROM users u LEFT JOIN user_settings s ON s.user_id = u.id WHERE u.id = $1`,
+      [req.user.id],
+    );
+    const row = u.rows[0];
+    if (!row) return res.status(404).json({ error: 'Hesap bulunamadı.' });
+    if (!(await bcrypt.compare(req.body.password, row.password_hash))) {
+      return res.status(403).json({ error: 'Parola hatalı.' });
+    }
+    if (row.two_factor_enabled) {
+      const check = await twofactor.verifySecondFactor(req.user.id, row.two_factor_secret, req.body.code);
+      if (!check.ok) {
+        if (check.locked) return res.status(429).json({ error: `Çok fazla hatalı deneme. ${check.retryAfterMin} dakika sonra tekrar deneyin.` });
+        return res.status(403).json({ error: 'Doğrulama kodu hatalı.' });
+      }
+    }
+    await adminOps.deleteUsers([req.user.id]);
+    return res.status(204).send();
+  } catch (err) {
+    console.error('delete account error', err);
+    return res.status(500).json({ error: 'Hesap silinemedi.' });
+  }
+});
 
 // POST /api/auth/2fa/setup — generates (or regenerates) a pending secret and
 // returns it as both raw base32 and an otpauth:// URI (render as a QR code

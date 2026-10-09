@@ -64,6 +64,17 @@ app.use('/api/settings', settingsRoutes);
 app.use('/api/backup', backupRoutes);
 app.use('/api/admin', adminRoutes);
 
+// Tarayıcıdan yönetim sayfası: yalnızca ADMIN_API_KEY ayarlıysa var olur. Sayfanın
+// kendisi sır içermez; tüm işlemler yine x-admin-key ister. (CSP satır içi betik
+// yasaklar, bu yüzden betik ayrı dosyadır.)
+const adminUiEnabled = (process.env.ADMIN_API_KEY || '').length >= 24;
+app.get('/admin', (req, res) => (adminUiEnabled
+  ? res.sendFile(require('path').join(__dirname, 'admin-ui', 'index.html'))
+  : res.status(404).json({ error: 'Bulunamadı.' })));
+app.get('/admin/app.js', (req, res) => (adminUiEnabled
+  ? res.type('application/javascript').sendFile(require('path').join(__dirname, 'admin-ui', 'app.js'))
+  : res.status(404).json({ error: 'Bulunamadı.' })));
+
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
 // eslint-disable-next-line no-unused-vars
