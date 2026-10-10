@@ -6,7 +6,7 @@ let initialized = false;
 /**
  * Lazily initializes firebase-admin from the FIREBASE_SERVICE_ACCOUNT_JSON
  * env var (the full service-account JSON, as one line/base64 — see
- * backend README, "Push Bildirimleri" section). If it's not set, push
+ * README.md, "Firebase push" section). If it's not set, push
  * sending silently no-ops everywhere else in this file — the rest of the
  * app (messaging, calls, etc.) keeps working normally without it.
  */

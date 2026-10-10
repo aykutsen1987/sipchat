@@ -1,6 +1,6 @@
 // One-off script: applies schema.sql to whatever DATABASE_URL points at.
 // Run locally with `npm run migrate`, or once via Render's Shell tab after
-// the first deploy (see backend README, "Adım 6").
+// the first deploy (see README.md, "Backend kurulumu").
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');

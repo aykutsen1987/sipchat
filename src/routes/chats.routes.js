@@ -12,7 +12,7 @@ const router = express.Router();
 router.use(requireAuth);
 
 // 20 MB cap (kept in memory only long enough to insert into Postgres as
-// bytea) — enough for a short video clip. See backend README's "Medya
+// bytea) — enough for a short video clip. See README.md's "Medya
 // Gönderimi" section for why this is fine on Render's free Postgres for a
 // demo/MVP but not for real scale.
 const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
@@ -345,7 +345,7 @@ router.post(
 );
 
 // DELETE /api/chats/:chatId/members/me — leave a group. (Leaving, not
-// removing others — no admin roles in this MVP; see README limitations.)
+// removing others — no admin roles in this MVP; see README.md "Bilinen sınırlar".)
 router.delete('/:chatId/members/me', [param('chatId').isUUID()], async (req, res) => {
   if (invalid(req)) return res.status(400).json({ error: 'Geçersiz chatId.' });
   const { chatId } = req.params;
