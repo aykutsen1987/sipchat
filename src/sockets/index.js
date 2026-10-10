@@ -68,20 +68,29 @@ function attachSockets(io) {
       if (!(await assertMember(chatId, socket.userId))) return;
       if (!(await assertMember(chatId, targetUserId))) return;
       if (await isChatBlocked(chatId, socket.userId)) return;
+      // Geçmiş kaydı: varsayılan MISSED; yanıtlanırsa ANSWERED, reddedilirse DECLINED olur.
+      // Önce kaydı yaz (await): cevap/ret çok hızlı gelirse güncelleme satırı bulabilsin.
+      await pool.query(
+        'INSERT INTO call_logs (caller_id, callee_id, chat_id, call_type) VALUES ($1, $2, $3, $4)',
+        [socket.userId, targetUserId, chatId, callType === 'VIDEO' ? 'VIDEO' : 'AUDIO'],
+      ).catch((err) => console.error('call log insert error (non-fatal)', err));
       io.to(`user:${targetUserId}`).emit('call:invite', {
         chatId, fromUserId: socket.userId, fromHandle: socket.userHandle, callType, sdpOffer,
       });
     });
     socket.on('call:answer', ({ targetUserId, sdpAnswer }) => {
+      updateOpenCall(socket.userId, targetUserId, "status = 'ANSWERED', answered_at = now()");
       io.to(`user:${targetUserId}`).emit('call:answer', { fromUserId: socket.userId, sdpAnswer });
     });
     socket.on('call:ice-candidate', ({ targetUserId, candidate }) => {
       io.to(`user:${targetUserId}`).emit('call:ice-candidate', { fromUserId: socket.userId, candidate });
     });
     socket.on('call:decline', ({ targetUserId }) => {
+      updateOpenCall(socket.userId, targetUserId, "status = 'DECLINED', ended_at = now()");
       io.to(`user:${targetUserId}`).emit('call:decline', { fromUserId: socket.userId });
     });
     socket.on('call:end', ({ targetUserId }) => {
+      updateOpenCall(socket.userId, targetUserId, 'ended_at = now()');
       io.to(`user:${targetUserId}`).emit('call:end', { fromUserId: socket.userId });
     });
 
@@ -90,6 +99,19 @@ function attachSockets(io) {
       if (!isOnline(io, socket.userId)) broadcastPresence(io, socket.userId, false);
     });
   });
+}
+
+/** İki kişi arasındaki en son açık (bitmemiş, 2 saatten yeni) arama kaydını günceller. */
+function updateOpenCall(userA, userB, setSql) {
+  if (typeof userB !== 'string') return;
+  pool.query(
+    `UPDATE call_logs SET ${setSql}
+      WHERE id = (SELECT id FROM call_logs
+                   WHERE ((caller_id = $1 AND callee_id = $2) OR (caller_id = $2 AND callee_id = $1))
+                     AND ended_at IS NULL AND started_at > now() - interval '2 hours'
+                   ORDER BY started_at DESC LIMIT 1)`,
+    [userA, userB],
+  ).catch((err) => console.error('call log update error (non-fatal)', err));
 }
 
 async function broadcastPresence(io, userId, online) {
@@ -163,6 +185,8 @@ function startDisappearingMessagesSweep(io, intervalMs = 60_000) {
         // eslint-disable-next-line no-await-in-loop
         await emitToMembers(io, row.chat_id, 'message:deleted', { chatId: row.chat_id, messageId: row.id });
       }
+      // Süresi dolan durumları (24 saat) sil.
+      await pool.query('DELETE FROM statuses WHERE expires_at <= now()');
     } catch (err) {
       console.error('disappearing messages sweep error (non-fatal)', err);
     }

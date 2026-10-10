@@ -141,3 +141,59 @@ CREATE TABLE IF NOT EXISTS two_factor_attempts (
     locked_until  TIMESTAMPTZ,
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ---------------------------------------------------------------------------
+-- Durumlar (24 saatlik paylaşımlar). İçerik uçtan uca şifrelidir: sunucu yalnızca
+-- şifreli yük ve her izleyiciye ayrı sarılmış anahtarı saklar.
+-- ---------------------------------------------------------------------------
+ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS status_visibility TEXT NOT NULL DEFAULT 'ALL'; -- ALL | EXCEPT | ONLY
+
+CREATE TABLE IF NOT EXISTS status_privacy_users (
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    contact_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, contact_id)
+);
+
+CREATE TABLE IF NOT EXISTS statuses (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind         TEXT NOT NULL CHECK (kind IN ('TEXT', 'IMAGE')),
+    payload_enc  TEXT NOT NULL,          -- AES-GCM(base64) metin/başlık/arka plan JSON'u
+    media_data   BYTEA,                  -- AES-GCM şifreli görsel baytları
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '24 hours')
+);
+CREATE INDEX IF NOT EXISTS idx_statuses_user ON statuses(user_id);
+CREATE INDEX IF NOT EXISTS idx_statuses_expires ON statuses(expires_at);
+
+CREATE TABLE IF NOT EXISTS status_keys (
+    status_id    UUID NOT NULL REFERENCES statuses(id) ON DELETE CASCADE,
+    viewer_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    wrapped_key  TEXT NOT NULL,          -- içerik anahtarı, izleyicinin açık anahtarıyla sarılı
+    PRIMARY KEY (status_id, viewer_id)
+);
+CREATE INDEX IF NOT EXISTS idx_status_keys_viewer ON status_keys(viewer_id);
+
+CREATE TABLE IF NOT EXISTS status_views (
+    status_id  UUID NOT NULL REFERENCES statuses(id) ON DELETE CASCADE,
+    viewer_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    viewed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (status_id, viewer_id)
+);
+
+-- Arama geçmişi
+CREATE TABLE IF NOT EXISTS call_logs (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    caller_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    callee_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    chat_id           UUID REFERENCES chats(id) ON DELETE SET NULL,
+    call_type         TEXT NOT NULL DEFAULT 'AUDIO',
+    status            TEXT NOT NULL DEFAULT 'MISSED',   -- MISSED | ANSWERED | DECLINED
+    started_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    answered_at       TIMESTAMPTZ,
+    ended_at          TIMESTAMPTZ,
+    hidden_by_caller  BOOLEAN NOT NULL DEFAULT false,
+    hidden_by_callee  BOOLEAN NOT NULL DEFAULT false
+);
+CREATE INDEX IF NOT EXISTS idx_call_logs_caller ON call_logs(caller_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_call_logs_callee ON call_logs(callee_id, started_at DESC);

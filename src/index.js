@@ -16,6 +16,8 @@ const sessionsRoutes = require('./routes/sessions.routes');
 const settingsRoutes = require('./routes/settings.routes');
 const backupRoutes = require('./routes/backup.routes');
 const adminRoutes = require('./routes/admin.routes');
+const statusRoutes = require('./routes/status.routes');
+const callsRoutes = require('./routes/calls.routes');
 const { attachSockets, startDisappearingMessagesSweep } = require('./sockets');
 
 const app = express();
@@ -63,6 +65,8 @@ app.use('/api/sessions', sessionsRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/backup', backupRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/status', statusRoutes);
+app.use('/api/calls', callsRoutes);
 
 // Tarayıcıdan yönetim sayfası: yalnızca ADMIN_API_KEY ayarlıysa var olur. Sayfanın
 // kendisi sır içermez; tüm işlemler yine x-admin-key ister. (CSP satır içi betik
