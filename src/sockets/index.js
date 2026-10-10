@@ -1,6 +1,7 @@
 const { verifyToken } = require('../utils/jwt');
 const { pool } = require('../db');
 const { sendPushToUser } = require('../push');
+const callState = require('../calls');
 const {
   memberIds, isOnline, emitToMembers, contactIds, isChatBlocked, getShowLastSeen, selectEnrichedMessage,
 } = require('../realtime');
@@ -34,6 +35,10 @@ function attachSockets(io) {
     if (socket.sessionId) {
       pool.query('UPDATE sessions SET last_seen_at = now() WHERE id = $1', [socket.sessionId]).catch(() => {});
     }
+
+    // Çalmakta olan aramalar (bağlantı yeni kurulduysa kaçırılmasın).
+    callState.replayPendingInvite(socket);
+    callState.replayGroupRinging(socket).catch(() => {});
 
     // Kept for older clients; live delivery now goes through the personal
     // `user:<id>` room, so joining chat rooms is no longer required.
@@ -72,30 +77,60 @@ function attachSockets(io) {
       // Önce kaydı yaz (await): cevap/ret çok hızlı gelirse güncelleme satırı bulabilsin.
       await pool.query(
         'INSERT INTO call_logs (caller_id, callee_id, chat_id, call_type) VALUES ($1, $2, $3, $4)',
-        [socket.userId, targetUserId, chatId, callType === 'VIDEO' ? 'VIDEO' : 'AUDIO'],
+        [socket.userId, targetUserId, chatId, String(callType).toUpperCase() === 'VIDEO' ? 'VIDEO' : 'AUDIO'],
       ).catch((err) => console.error('call log insert error (non-fatal)', err));
-      io.to(`user:${targetUserId}`).emit('call:invite', {
+      const invitePayload = {
         chatId, fromUserId: socket.userId, fromHandle: socket.userHandle, callType, sdpOffer,
+      };
+      callState.registerInvite(io, targetUserId, invitePayload, () => {
+        // Yanıt gelmedi: kayıt MISSED kalır, yalnızca bitiş zamanı yazılır.
+        updateOpenCall(socket.userId, targetUserId, 'ended_at = now()');
       });
+      io.to(`user:${targetUserId}`).emit('call:invite', invitePayload);
     });
     socket.on('call:answer', ({ targetUserId, sdpAnswer }) => {
+      callState.clearPendingBetween(socket.userId, targetUserId);
       updateOpenCall(socket.userId, targetUserId, "status = 'ANSWERED', answered_at = now()");
       io.to(`user:${targetUserId}`).emit('call:answer', { fromUserId: socket.userId, sdpAnswer });
     });
     socket.on('call:ice-candidate', ({ targetUserId, candidate }) => {
+      callState.bufferIce(targetUserId, socket.userId, candidate);
       io.to(`user:${targetUserId}`).emit('call:ice-candidate', { fromUserId: socket.userId, candidate });
     });
     socket.on('call:decline', ({ targetUserId }) => {
+      callState.clearPendingBetween(socket.userId, targetUserId);
       updateOpenCall(socket.userId, targetUserId, "status = 'DECLINED', ended_at = now()");
       io.to(`user:${targetUserId}`).emit('call:decline', { fromUserId: socket.userId });
     });
     socket.on('call:end', ({ targetUserId }) => {
+      callState.clearPendingBetween(socket.userId, targetUserId);
       updateOpenCall(socket.userId, targetUserId, 'ended_at = now()');
       io.to(`user:${targetUserId}`).emit('call:end', { fromUserId: socket.userId });
     });
 
+    // --- Grup araması (mesh, sesli): başlat/katıl, ayrıl, sinyal ilet ---
+    socket.on('gcall:join', async ({ chatId } = {}, ack) => {
+      try {
+        if (typeof chatId !== 'string') return ack?.({ ok: false, error: 'invalid' });
+        const result = await callState.joinGroupCall(io, socket.userId, chatId);
+        if (result.error) return ack?.({ ok: false, error: result.error });
+        return ack?.({ ok: true, created: result.created, participants: result.existing, max: callState.MAX_GROUP_PARTICIPANTS });
+      } catch (err) {
+        console.error('gcall:join error', err);
+        return ack?.({ ok: false, error: 'server error' });
+      }
+    });
+    socket.on('gcall:leave', async ({ chatId } = {}) => {
+      if (typeof chatId === 'string') await callState.leaveGroupCall(io, socket.userId, chatId).catch(() => {});
+    });
+    socket.on('gcall:signal', ({ chatId, targetUserId, data } = {}) => {
+      if (typeof chatId !== 'string' || typeof targetUserId !== 'string' || !data) return;
+      callState.relayGroupSignal(io, socket.userId, chatId, targetUserId, data);
+    });
+
     socket.on('disconnect', () => {
       console.log(`socket disconnected: ${socket.userHandle} (${socket.id})`);
+      if (!isOnline(io, socket.userId)) callState.leaveAllGroupCalls(io, socket.userId).catch(() => {});
       if (!isOnline(io, socket.userId)) broadcastPresence(io, socket.userId, false);
     });
   });
