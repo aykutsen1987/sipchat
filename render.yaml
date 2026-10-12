@@ -14,6 +14,12 @@ services:
       # Pasif kullanıcı yönetimi için Render panelinden elle girin (en az 24 karakter).
       - key: ADMIN_API_KEY
         sync: false
+      # Google ile giriş için Web OAuth istemci kimliği (boşsa özellik kapalı).
+      - key: GOOGLE_CLIENT_IDS
+        sync: false
+      # E-posta eşleştirme biberi. Değişirse eşleşme listeleri geçersiz olur.
+      - key: EMAIL_PEPPER
+        generateValue: true
       - key: ALLOWED_ORIGINS
         value: ""
       - key: DATABASE_URL

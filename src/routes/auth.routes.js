@@ -7,6 +7,9 @@ const { requireAuth } = require('../middleware/auth');
 const totp = require('../totp');
 const twofactor = require('../twofactor');
 const adminOps = require('../admin');
+const google = require('../google');
+const crypto = require('crypto');
+const { hashEmail } = require('../emailhash');
 
 const router = express.Router();
 
@@ -205,6 +208,128 @@ router.get('/me', requireAuth, async (req, res) => {
 });
 
 // --- Two-factor authentication management (requires an existing session) ---
+
+// ---------------------------------------------------------------------------
+// Google ile giriş / kayıt
+// ---------------------------------------------------------------------------
+
+// GET /api/auth/config — istemci hangi giriş yöntemlerinin açık olduğunu buradan öğrenir.
+router.get('/config', (req, res) => {
+  const ids = google.clientIds();
+  res.json({ googleEnabled: ids.length > 0, googleClientId: ids[0] || null });
+});
+
+function suggestHandle(email, name) {
+  const base = String(email || name || 'kullanici').split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '');
+  const trimmed = (base.length >= 3 ? base : `${base}user`).slice(0, 16);
+  return trimmed.length >= 3 ? trimmed : 'kullanici';
+}
+
+// POST /api/auth/google {idToken, handle?, displayName?, deviceName?}
+//  - bu Google hesabı daha önce bağlanmışsa: giriş (2FA açıksa ikinci adım istenir)
+//  - yeni hesapsa ve handle yoksa: {needsHandle:true, suggestedHandle, email, displayName}
+//  - yeni hesapsa ve handle varsa: hesabı oluşturur (parola yok; yalnızca Google ile girilir)
+router.post(
+  '/google',
+  [
+    body('idToken').isString().isLength({ min: 10, max: 5000 }),
+    body('handle').optional().trim().toLowerCase().matches(HANDLE_REGEX),
+    body('displayName').optional().trim().isLength({ min: 1, max: 60 }),
+    body('deviceName').optional().isString().isLength({ max: 120 }),
+  ],
+  async (req, res) => {
+    if (!google.enabled()) return res.status(404).json({ error: 'Google ile giriş yapılandırılmamış.' });
+    if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'Geçersiz istek.' });
+
+    let g;
+    try {
+      g = await google.verifyIdToken(req.body.idToken);
+    } catch (err) {
+      return res.status(401).json({ error: 'Google doğrulaması başarısız.' });
+    }
+    if (!g?.sub || !g.email || g.email_verified !== true) {
+      return res.status(400).json({ error: 'Google e-posta adresiniz doğrulanmamış.' });
+    }
+
+    try {
+      const existing = await pool.query(
+        `SELECT u.id, u.handle, u.display_name, u.avatar_url, COALESCE(s.two_factor_enabled, false) AS two_factor_enabled
+           FROM users u LEFT JOIN user_settings s ON s.user_id = u.id WHERE u.google_sub = $1`,
+        [g.sub],
+      );
+      if (existing.rows.length > 0) {
+        const user = existing.rows[0];
+        if (user.two_factor_enabled) {
+          const pendingToken = signToken({ sub: user.id, handle: user.handle, purpose: '2fa_pending' }, '5m');
+          return res.json({ requiresTwoFactor: true, pendingToken });
+        }
+        const { token } = await createSession(user.id, user.handle, req.body.deviceName);
+        return res.json({ token, user: toPublicUser(user) });
+      }
+
+      const emailTaken = await pool.query('SELECT 1 FROM users WHERE lower(email) = lower($1)', [g.email]);
+      if (emailTaken.rows.length > 0) {
+        return res.status(409).json({ error: 'Bu e-posta başka bir hesaba bağlı. O hesapla giriş yapıp Ayarlar\'dan Google\'ı bağlayın.' });
+      }
+
+      const handle = req.body.handle;
+      if (!handle) {
+        let suggested = suggestHandle(g.email, g.name);
+        const clash = await pool.query('SELECT 1 FROM users WHERE handle = $1', [suggested]);
+        if (clash.rows.length > 0) suggested = `${suggested.slice(0, 14)}${Math.floor(10 + Math.random() * 89)}`;
+        return res.json({ needsHandle: true, suggestedHandle: suggested, email: g.email, displayName: g.name || suggested });
+      }
+
+      const taken = await pool.query('SELECT 1 FROM users WHERE handle = $1', [handle]);
+      if (taken.rows.length > 0) return res.status(409).json({ error: 'Bu kullanıcı adı zaten alınmış.' });
+
+      const randomHash = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10);
+      const displayName = (req.body.displayName || g.name || handle).slice(0, 60);
+      const created = await pool.query(
+        `INSERT INTO users (handle, display_name, password_hash, email, email_verified, google_sub, email_hash)
+         VALUES ($1, $2, $3, $4, true, $5, $6) RETURNING id, handle, display_name, avatar_url`,
+        [handle, displayName, randomHash, g.email.toLowerCase(), g.sub, hashEmail(g.email)],
+      );
+      const user = created.rows[0];
+      await pool.query('INSERT INTO user_settings (user_id) VALUES ($1)', [user.id]);
+      const { token } = await createSession(user.id, user.handle, req.body.deviceName);
+      return res.status(201).json({ token, user: toPublicUser(user) });
+    } catch (err) {
+      console.error('google auth error', err);
+      return res.status(500).json({ error: 'Google ile giriş sırasında bir hata oluştu.' });
+    }
+  },
+);
+
+// POST /api/auth/google/link {idToken} — mevcut hesaba Google'ı (ve doğrulanmış e-postayı) bağlar.
+router.post('/google/link', requireAuth, [body('idToken').isString().isLength({ min: 10, max: 5000 })], async (req, res) => {
+  if (!google.enabled()) return res.status(404).json({ error: 'Google ile giriş yapılandırılmamış.' });
+  if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'Geçersiz istek.' });
+  let g;
+  try {
+    g = await google.verifyIdToken(req.body.idToken);
+  } catch (err) {
+    return res.status(401).json({ error: 'Google doğrulaması başarısız.' });
+  }
+  if (!g?.sub || !g.email || g.email_verified !== true) {
+    return res.status(400).json({ error: 'Google e-posta adresiniz doğrulanmamış.' });
+  }
+  try {
+    const clash = await pool.query(
+      'SELECT id FROM users WHERE (google_sub = $1 OR lower(email) = lower($2)) AND id <> $3',
+      [g.sub, g.email, req.user.id],
+    );
+    if (clash.rows.length > 0) return res.status(409).json({ error: 'Bu Google hesabı başka bir SipChat hesabına bağlı.' });
+    await pool.query(
+      'UPDATE users SET google_sub = $2, email = $3, email_verified = true, email_hash = $4 WHERE id = $1',
+      [req.user.id, g.sub, g.email.toLowerCase(), hashEmail(g.email)],
+    );
+    return res.json({ email: g.email.toLowerCase() });
+  } catch (err) {
+    console.error('google link error', err);
+    return res.status(500).json({ error: 'Google hesabı bağlanamadı.' });
+  }
+});
 
 // DELETE /api/auth/me {password, code?} — permanently deletes the caller's own
 // account (sessions, keys, memberships, their messages, backup…). Requires the

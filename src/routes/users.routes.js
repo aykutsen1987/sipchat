@@ -3,6 +3,8 @@ const multer = require('multer');
 const { body, param, query, validationResult } = require('express-validator');
 const { pool } = require('../db');
 const { requireAuth } = require('../middleware/auth');
+const rateLimit = require('express-rate-limit');
+const { hashEmail, normalize, isEmail } = require('../emailhash');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -47,6 +49,104 @@ router.put(
     }
   },
 );
+
+// ---------------------------------------------------------------------------
+// E-posta eşleştirme ("karşılıklı eşleşme"): iki kişi ancak İKİSİ DE birbirinin doğrulanmış
+// e-postasını listesine eklediyse ve ikisi de eşleştirmeye katıldıysa birbirini bulur. Sunucu
+// yalnızca anahtarlı özetleri saklar; tek taraflı eşleşmeler kimseye gösterilmez (hesap keşfi yok).
+// ---------------------------------------------------------------------------
+const MAX_KNOWN_EMAILS = 500;
+const knownEmailsLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false,
+  keyGenerator: (req) => `known:${req.user?.id || req.ip}`,
+  message: { error: 'Çok sık güncellediniz, bir saat sonra tekrar deneyin.' },
+});
+
+// GET /api/users/me/email
+router.get('/me/email', async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT u.email, u.email_verified, u.google_sub IS NOT NULL AS google_linked, u.email_matching_enabled,
+              (SELECT COUNT(*)::int FROM contact_hashes c WHERE c.user_id = u.id) AS known_count
+         FROM users u WHERE u.id = $1`,
+      [req.user.id],
+    );
+    const u = r.rows[0];
+    res.json({
+      email: u.email, verified: u.email_verified, googleLinked: u.google_linked,
+      matchingEnabled: u.email_matching_enabled, knownCount: u.known_count,
+    });
+  } catch (err) {
+    console.error('get email status error', err);
+    res.status(500).json({ error: 'E-posta bilgisi alınamadı.' });
+  }
+});
+
+// PATCH /api/users/me/email-matching {enabled} — varsayılan kapalı; doğrulanmış e-posta gerekir.
+router.patch('/me/email-matching', [body('enabled').isBoolean()], async (req, res) => {
+  if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'Geçersiz değer.' });
+  try {
+    const enabled = req.body.enabled === true || req.body.enabled === 'true';
+    const r = await pool.query(
+      'UPDATE users SET email_matching_enabled = $2 WHERE id = $1 AND ($2 = false OR email_verified) RETURNING email_matching_enabled',
+      [req.user.id, enabled],
+    );
+    if (r.rows.length === 0) return res.status(400).json({ error: 'Önce Google hesabınızı bağlayıp e-postanızı doğrulayın.' });
+    res.json({ matchingEnabled: r.rows[0].email_matching_enabled });
+  } catch (err) {
+    console.error('email matching toggle error', err);
+    res.status(500).json({ error: 'Ayar kaydedilemedi.' });
+  }
+});
+
+// PUT /api/users/me/known-emails {emails: [...]} — "tanıdığım e-postalar" listemi değiştirir.
+router.put('/me/known-emails', knownEmailsLimiter, [body('emails').isArray({ max: MAX_KNOWN_EMAILS })], async (req, res) => {
+  if (!validationResult(req).isEmpty()) return res.status(400).json({ error: `En fazla ${MAX_KNOWN_EMAILS} e-posta.` });
+  const emails = [...new Set(req.body.emails.map(normalize).filter(isEmail))];
+  const client = await pool.connect();
+  try {
+    const own = await pool.query('SELECT email_hash FROM users WHERE id = $1', [req.user.id]);
+    const ownHash = own.rows[0]?.email_hash;
+    const hashes = [...new Set(emails.map(hashEmail))].filter((h) => h !== ownHash);
+    await client.query('BEGIN');
+    await client.query('DELETE FROM contact_hashes WHERE user_id = $1', [req.user.id]);
+    if (hashes.length) {
+      await client.query('INSERT INTO contact_hashes (user_id, hash) SELECT $1, unnest($2::text[])', [req.user.id, hashes]);
+    }
+    await client.query('COMMIT');
+    res.json({ count: hashes.length });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('known emails error', err);
+    res.status(500).json({ error: 'Liste kaydedilemedi.' });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/users/matches — yalnızca KARŞILIKLI eşleşenler.
+router.get('/matches', async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT u.id, u.handle, u.display_name, u.avatar_url
+         FROM users me
+         JOIN contact_hashes mine ON mine.user_id = me.id
+         JOIN users u ON u.email_hash = mine.hash AND u.id <> me.id
+        WHERE me.id = $1
+          AND me.email_matching_enabled AND me.email_verified AND me.email_hash IS NOT NULL
+          AND u.email_matching_enabled AND u.email_verified
+          AND EXISTS (SELECT 1 FROM contact_hashes theirs WHERE theirs.user_id = u.id AND theirs.hash = me.email_hash)
+          AND NOT EXISTS (SELECT 1 FROM blocked_users b
+                           WHERE (b.blocker_id = $1 AND b.blocked_id = u.id) OR (b.blocker_id = u.id AND b.blocked_id = $1))
+        ORDER BY u.display_name`,
+      [req.user.id],
+    );
+    res.json({ matches: r.rows.map((u) => ({ id: u.id, handle: u.handle, displayName: u.display_name, avatarUrl: u.avatar_url })) });
+  } catch (err) {
+    console.error('matches error', err);
+    res.status(500).json({ error: 'Eşleşmeler alınamadı.' });
+  }
+});
 
 // PUT /api/users/me/avatar — multipart field "file" (JPEG/PNG/WebP, ≤ 2 MB).
 // avatar_url becomes an absolute URL to GET /api/users/:id/avatar with a

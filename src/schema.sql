@@ -197,3 +197,25 @@ CREATE TABLE IF NOT EXISTS call_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_call_logs_caller ON call_logs(caller_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_call_logs_callee ON call_logs(callee_id, started_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Google ile giriş + e-posta eşleştirme
+-- ---------------------------------------------------------------------------
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub TEXT;
+-- Anahtarlı özet (HMAC); düz e-posta eşleştirme için kullanılmaz.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_hash TEXT;
+-- Varsayılan KAPALI: kullanıcı açıkça katılmadıkça kimse onu e-postasıyla eşleştiremez.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_matching_enabled BOOLEAN NOT NULL DEFAULT false;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users(lower(email)) WHERE email IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_users_email_hash ON users(email_hash) WHERE email_hash IS NOT NULL;
+
+-- Kullanıcının "tanıdığım e-postalar" listesi: yalnızca anahtarlı özetler saklanır.
+CREATE TABLE IF NOT EXISTS contact_hashes (
+    user_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    hash     TEXT NOT NULL,
+    PRIMARY KEY (user_id, hash)
+);
+CREATE INDEX IF NOT EXISTS idx_contact_hashes_hash ON contact_hashes(hash);
