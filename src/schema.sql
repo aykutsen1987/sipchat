@@ -219,3 +219,7 @@ CREATE TABLE IF NOT EXISTS contact_hashes (
     PRIMARY KEY (user_id, hash)
 );
 CREATE INDEX IF NOT EXISTS idx_contact_hashes_hash ON contact_hashes(hash);
+
+-- Google ile açılan hesapların bilinen bir parolası yoktur (rastgele özet); silme gibi hassas işlemlerde
+-- parola yerine taze bir Google doğrulaması istenir.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS has_password BOOLEAN NOT NULL DEFAULT true;

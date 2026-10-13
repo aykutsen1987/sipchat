@@ -286,8 +286,8 @@ router.post(
       const randomHash = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10);
       const displayName = (req.body.displayName || g.name || handle).slice(0, 60);
       const created = await pool.query(
-        `INSERT INTO users (handle, display_name, password_hash, email, email_verified, google_sub, email_hash)
-         VALUES ($1, $2, $3, $4, true, $5, $6) RETURNING id, handle, display_name, avatar_url`,
+        `INSERT INTO users (handle, display_name, password_hash, email, email_verified, google_sub, email_hash, has_password)
+         VALUES ($1, $2, $3, $4, true, $5, $6, false) RETURNING id, handle, display_name, avatar_url`,
         [handle, displayName, randomHash, g.email.toLowerCase(), g.sub, hashEmail(g.email)],
       );
       const user = created.rows[0];
@@ -335,17 +335,34 @@ router.post('/google/link', requireAuth, [body('idToken').isString().isLength({ 
 // account (sessions, keys, memberships, their messages, backup…). Requires the
 // password, and the 2FA/backup code when 2FA is on. Wrong credentials answer 403
 // (not 401) so the app doesn't mistake it for an expired session.
-router.delete('/me', requireAuth, [body('password').isString().isLength({ min: 1, max: 200 })], async (req, res) => {
-  if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'Parola gerekli.' });
+router.delete(
+  '/me',
+  requireAuth,
+  [body('password').optional().isString().isLength({ max: 200 }), body('idToken').optional().isString().isLength({ max: 5000 })],
+  async (req, res) => {
+  if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'Geçersiz istek.' });
+  if (!req.body.password && !req.body.idToken) return res.status(400).json({ error: 'Parola ya da Google doğrulaması gerekli.' });
   try {
     const u = await pool.query(
-      `SELECT u.password_hash, s.two_factor_enabled, s.two_factor_secret
+      `SELECT u.password_hash, u.google_sub, u.has_password, s.two_factor_enabled, s.two_factor_secret
          FROM users u LEFT JOIN user_settings s ON s.user_id = u.id WHERE u.id = $1`,
       [req.user.id],
     );
     const row = u.rows[0];
     if (!row) return res.status(404).json({ error: 'Hesap bulunamadı.' });
-    if (!(await bcrypt.compare(req.body.password, row.password_hash))) {
+    if (req.body.idToken) {
+      // Google ile açılan (parolasız) hesaplar: taze bir Google doğrulaması, hesabın bağlı Google kimliğiyle eşleşmeli.
+      if (!google.enabled() || !row.google_sub) return res.status(403).json({ error: 'Bu hesap Google ile doğrulanamıyor.' });
+      let g;
+      try {
+        g = await google.verifyIdToken(req.body.idToken);
+      } catch (err) {
+        return res.status(403).json({ error: 'Google doğrulaması başarısız.' });
+      }
+      if (g?.sub !== row.google_sub) return res.status(403).json({ error: 'Bu Google hesabı SipChat hesabınızla eşleşmiyor.' });
+    } else if (!row.has_password) {
+      return res.status(403).json({ error: 'Bu hesap Google ile açıldı; Google ile doğrulayın.' });
+    } else if (!(await bcrypt.compare(req.body.password, row.password_hash))) {
       return res.status(403).json({ error: 'Parola hatalı.' });
     }
     if (row.two_factor_enabled) {
@@ -361,7 +378,8 @@ router.delete('/me', requireAuth, [body('password').isString().isLength({ min: 1
     console.error('delete account error', err);
     return res.status(500).json({ error: 'Hesap silinemedi.' });
   }
-});
+  },
+);
 
 // POST /api/auth/2fa/setup — generates (or regenerates) a pending secret and
 // returns it as both raw base32 and an otpauth:// URI (render as a QR code

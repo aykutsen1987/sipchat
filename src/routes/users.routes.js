@@ -66,7 +66,7 @@ const knownEmailsLimiter = rateLimit({
 router.get('/me/email', async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT u.email, u.email_verified, u.google_sub IS NOT NULL AS google_linked, u.email_matching_enabled,
+      `SELECT u.email, u.email_verified, u.google_sub IS NOT NULL AS google_linked, u.email_matching_enabled, u.has_password,
               (SELECT COUNT(*)::int FROM contact_hashes c WHERE c.user_id = u.id) AS known_count
          FROM users u WHERE u.id = $1`,
       [req.user.id],
@@ -74,7 +74,7 @@ router.get('/me/email', async (req, res) => {
     const u = r.rows[0];
     res.json({
       email: u.email, verified: u.email_verified, googleLinked: u.google_linked,
-      matchingEnabled: u.email_matching_enabled, knownCount: u.known_count,
+      matchingEnabled: u.email_matching_enabled, knownCount: u.known_count, hasPassword: u.has_password,
     });
   } catch (err) {
     console.error('get email status error', err);
