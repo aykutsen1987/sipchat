@@ -11,7 +11,8 @@
     "start": "node src/migrate.js && node src/index.js",
     "dev": "node --watch src/index.js",
     "migrate": "node src/migrate.js",
-    "admin": "node scripts/admin.js"
+    "admin": "node scripts/admin.js",
+    "smoke": "node scripts/smoke-test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

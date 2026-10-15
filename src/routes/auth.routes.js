@@ -10,6 +10,7 @@ const adminOps = require('../admin');
 const google = require('../google');
 const crypto = require('crypto');
 const { hashEmail } = require('../emailhash');
+const recovery = require('../recovery');
 
 const router = express.Router();
 
@@ -78,8 +79,11 @@ router.post(
       // assume it always exists — no scattered "row might not exist" checks.
       await pool.query('INSERT INTO user_settings (user_id) VALUES ($1)', [user.id]);
 
+      // Parola sıfırlama için kurtarma anahtarı: yalnızca burada (ve Ayarlar'dan yenilenince) düz hâliyle gösterilir.
+      const recoveryKey = await recovery.issueKey(user.id);
+
       const { token } = await createSession(user.id, user.handle, deviceName);
-      return res.status(201).json({ token, user: toPublicUser(user) });
+      return res.status(201).json({ token, user: toPublicUser(user), recoveryKey });
     } catch (err) {
       console.error('register error', err);
       return res.status(500).json({ error: 'Kayıt sırasında bir hata oluştu.' });
@@ -331,6 +335,175 @@ router.post('/google/link', requireAuth, [body('idToken').isString().isLength({ 
   }
 });
 
+// ---------------------------------------------------------------------------
+// Parola sıfırlama / hesap kurtarma (ücretsiz, e-posta ya da SMS gerektirmez)
+// ---------------------------------------------------------------------------
+
+/** Tüm oturumları sonlandırır (parola değişince eski cihazlar çıkış yapar). */
+async function revokeAllSessions(userId) {
+  await pool.query('UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [userId]);
+}
+
+/** 2FA açıksa ikinci faktörü doğrular. Dönüş: null (sorun yok) ya da { status, body }. */
+async function requireSecondFactorIfEnabled(userId, code) {
+  const s = await pool.query('SELECT two_factor_enabled, two_factor_secret FROM user_settings WHERE user_id = $1', [userId]);
+  const row = s.rows[0];
+  if (!row?.two_factor_enabled) return null;
+  if (!code) {
+    return { status: 401, body: { error: 'İki aşamalı doğrulama kodu (ya da yedek kod) gerekli.', requiresTwoFactor: true } };
+  }
+  const check = await twofactor.verifySecondFactor(userId, row.two_factor_secret, code);
+  if (check.ok) return null;
+  if (check.locked) return { status: 429, body: { error: `Çok fazla hatalı deneme. ${check.retryAfterMin} dakika sonra tekrar deneyin.` } };
+  return { status: 401, body: { error: 'Doğrulama kodu hatalı.', requiresTwoFactor: true } };
+}
+
+// GET /api/auth/recovery-key/status — bu hesabın bir kurtarma anahtarı var mı?
+router.get('/recovery-key/status', requireAuth, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT recovery_hash IS NOT NULL AS exists, recovery_created_at, has_password, google_sub IS NOT NULL AS google_linked FROM users WHERE id = $1', [req.user.id]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Hesap bulunamadı.' });
+    return res.json({
+      exists: r.rows[0].exists,
+      createdAt: r.rows[0].recovery_created_at,
+      hasPassword: r.rows[0].has_password,
+      googleLinked: r.rows[0].google_linked,
+    });
+  } catch (err) {
+    console.error('recovery status error', err);
+    return res.status(500).json({ error: 'Durum alınamadı.' });
+  }
+});
+
+// POST /api/auth/recovery-key {password | idToken, code?} — yeni kurtarma anahtarı üretir (eskisi geçersiz olur).
+// Çalınmış bir oturumun hesabı ele geçirmesini önlemek için parola (Google hesaplarında taze Google doğrulaması)
+// ve 2FA açıksa kod ister.
+router.post(
+  '/recovery-key',
+  requireAuth,
+  [
+    body('password').optional().isString().isLength({ max: 200 }),
+    body('idToken').optional().isString().isLength({ max: 5000 }),
+    body('code').optional().isString().isLength({ max: 16 }),
+  ],
+  async (req, res) => {
+    if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'Geçersiz istek.' });
+    if (!req.body.password && !req.body.idToken) return res.status(400).json({ error: 'Parola ya da Google doğrulaması gerekli.' });
+    try {
+      const u = await pool.query('SELECT password_hash, google_sub, has_password FROM users WHERE id = $1', [req.user.id]);
+      const row = u.rows[0];
+      if (!row) return res.status(404).json({ error: 'Hesap bulunamadı.' });
+      if (req.body.idToken) {
+        if (!google.enabled() || !row.google_sub) return res.status(403).json({ error: 'Bu hesap Google ile doğrulanamıyor.' });
+        let g;
+        try {
+          g = await google.verifyIdToken(req.body.idToken);
+        } catch (err) {
+          return res.status(403).json({ error: 'Google doğrulaması başarısız.' });
+        }
+        if (g?.sub !== row.google_sub) return res.status(403).json({ error: 'Bu Google hesabı SipChat hesabınızla eşleşmiyor.' });
+      } else if (!row.has_password) {
+        return res.status(403).json({ error: 'Bu hesap Google ile açıldı; Google ile doğrulayın.' });
+      } else if (!(await bcrypt.compare(req.body.password, row.password_hash))) {
+        return res.status(403).json({ error: 'Parola hatalı.' });
+      }
+      const blocked = await requireSecondFactorIfEnabled(req.user.id, req.body.code);
+      if (blocked) return res.status(blocked.status === 401 ? 403 : blocked.status).json(blocked.body);
+
+      const recoveryKey = await recovery.issueKey(req.user.id);
+      return res.json({ recoveryKey });
+    } catch (err) {
+      console.error('recovery key error', err);
+      return res.status(500).json({ error: 'Kurtarma anahtarı oluşturulamadı.' });
+    }
+  },
+);
+
+// POST /api/auth/reset-password {handle, recoveryKey, newPassword, code?}
+// Oturum gerekmez. Başarılı olunca parola değişir, TÜM oturumlar kapatılır, kurtarma anahtarı yenilenir
+// (yeni anahtar yanıtta döner) ve 2FA açıksa kod da istenir. Hatalı denemeler hesap bazında kilitlenir.
+router.post(
+  '/reset-password',
+  [
+    body('handle').trim().toLowerCase().matches(HANDLE_REGEX),
+    body('recoveryKey').isString().isLength({ min: 10, max: 40 }),
+    body('newPassword').isLength({ min: 8, max: 128 }).withMessage('Şifre en az 8 karakter olmalı'),
+    body('code').optional().isString().isLength({ max: 16 }),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg || 'Geçersiz istek.' });
+    const { handle, recoveryKey, newPassword, code } = req.body;
+    const GENERIC = 'Kullanıcı adı veya kurtarma anahtarı hatalı.';
+    try {
+      const u = await pool.query('SELECT id, recovery_hash FROM users WHERE lower(handle) = $1', [handle]);
+      const user = u.rows[0];
+      if (!user || !user.recovery_hash) return res.status(401).json({ error: GENERIC });
+
+      const left = await recovery.lockRemainingMs(user.id);
+      if (left > 0) {
+        return res.status(429).json({ error: `Çok fazla hatalı deneme. ${Math.ceil(left / 60000)} dakika sonra tekrar deneyin.` });
+      }
+      if (!recovery.keyMatches(user.recovery_hash, recoveryKey)) {
+        await recovery.recordFailure(user.id);
+        return res.status(401).json({ error: GENERIC });
+      }
+
+      const blocked = await requireSecondFactorIfEnabled(user.id, code);
+      if (blocked) return res.status(blocked.status).json(blocked.body);
+
+      await recovery.clearFailures(user.id);
+      const hash = await bcrypt.hash(newPassword, 12);
+      await pool.query('UPDATE users SET password_hash = $2, has_password = true WHERE id = $1', [user.id, hash]);
+      await revokeAllSessions(user.id);
+      const newKey = await recovery.issueKey(user.id);
+      return res.json({ ok: true, recoveryKey: newKey });
+    } catch (err) {
+      console.error('reset password error', err);
+      return res.status(500).json({ error: 'Parola sıfırlanamadı.' });
+    }
+  },
+);
+
+// POST /api/auth/reset-password/google {idToken, newPassword, code?} — Google'ı bağlı hesaplar için
+// kurtarma anahtarı olmadan: taze Google doğrulaması parolayı yenilemeye yeter.
+router.post(
+  '/reset-password/google',
+  [
+    body('idToken').isString().isLength({ min: 10, max: 5000 }),
+    body('newPassword').isLength({ min: 8, max: 128 }).withMessage('Şifre en az 8 karakter olmalı'),
+    body('code').optional().isString().isLength({ max: 16 }),
+  ],
+  async (req, res) => {
+    if (!google.enabled()) return res.status(404).json({ error: 'Google ile doğrulama yapılandırılmamış.' });
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg || 'Geçersiz istek.' });
+    let g;
+    try {
+      g = await google.verifyIdToken(req.body.idToken);
+    } catch (err) {
+      return res.status(401).json({ error: 'Google doğrulaması başarısız.' });
+    }
+    if (!g?.sub || g.email_verified !== true) return res.status(400).json({ error: 'Google e-posta adresiniz doğrulanmamış.' });
+    try {
+      const u = await pool.query('SELECT id, handle FROM users WHERE google_sub = $1', [g.sub]);
+      const user = u.rows[0];
+      if (!user) return res.status(404).json({ error: 'Bu Google hesabına bağlı bir SipChat hesabı yok.' });
+
+      const blocked = await requireSecondFactorIfEnabled(user.id, req.body.code);
+      if (blocked) return res.status(blocked.status).json(blocked.body);
+
+      const hash = await bcrypt.hash(req.body.newPassword, 12);
+      await pool.query('UPDATE users SET password_hash = $2, has_password = true WHERE id = $1', [user.id, hash]);
+      await revokeAllSessions(user.id);
+      return res.json({ ok: true, handle: user.handle });
+    } catch (err) {
+      console.error('google reset password error', err);
+      return res.status(500).json({ error: 'Parola sıfırlanamadı.' });
+    }
+  },
+);
+
 // DELETE /api/auth/me {password, code?} — permanently deletes the caller's own
 // account (sessions, keys, memberships, their messages, backup…). Requires the
 // password, and the 2FA/backup code when 2FA is on. Wrong credentials answer 403
@@ -372,7 +545,7 @@ router.delete(
         return res.status(403).json({ error: 'Doğrulama kodu hatalı.' });
       }
     }
-    await adminOps.deleteUsers([req.user.id]);
+    await adminOps.deleteUsers([req.user.id], req.app.get('io'));
     return res.status(204).send();
   } catch (err) {
     console.error('delete account error', err);

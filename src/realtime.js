@@ -63,6 +63,7 @@ async function isChatBlocked(chatId, userId) {
 
 const MESSAGE_SELECT = `
   SELECT m.id, m.chat_id, m.sender_id, m.type, m.text, m.created_at,
+         m.reply_to_id, m.edited_at, m.forwarded,
          (m.media_data IS NOT NULL) AS has_media, m.media_mime, m.media_filename,
          octet_length(m.media_data) AS media_size,
          EXISTS (
@@ -84,7 +85,37 @@ async function selectEnrichedMessage(messageId) {
   return r.rows[0];
 }
 
+/** Üyenin sohbetteki rolü ('ADMIN' | 'MEMBER'); üye değilse null. */
+async function memberRole(chatId, userId) {
+  const r = await pool.query('SELECT role FROM chat_members WHERE chat_id = $1 AND user_id = $2', [chatId, userId]);
+  return r.rows.length ? r.rows[0].role : null;
+}
+
+/** replyToId aynı sohbetteki var olan bir mesaja işaret ediyor mu? (yoksa/boşsa true: yanıt isteğe bağlı) */
+async function validReplyTarget(chatId, replyToId) {
+  if (!replyToId) return true;
+  const r = await pool.query('SELECT 1 FROM messages WHERE id = $1 AND chat_id = $2', [replyToId, chatId]);
+  return r.rows.length > 0;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Metin mesajını ekler (REST ve soket yolu ortak kullanır). Üyelik/engel kontrolü çağıranda yapılır.
+ * Dönüş: { message } ya da { error }.
+ */
+async function insertTextMessage({ chatId, senderId, text, replyToId = null, forwarded = false }) {
+  if (replyToId && !UUID_RE.test(String(replyToId))) return { error: 'invalid reply' };
+  if (!(await validReplyTarget(chatId, replyToId))) return { error: 'invalid reply' };
+  const inserted = await pool.query(
+    `INSERT INTO messages (chat_id, sender_id, type, text, reply_to_id, forwarded)
+     VALUES ($1, $2, 'TEXT', $3, $4, $5) RETURNING id`,
+    [chatId, senderId, text, replyToId || null, forwarded === true],
+  );
+  return { message: await selectEnrichedMessage(inserted.rows[0].id) };
+}
+
 module.exports = {
   memberIds, isOnline, emitToMembers, contactIds, isBlocked, isChatBlocked, getShowLastSeen,
-  MESSAGE_SELECT, selectEnrichedMessage,
+  MESSAGE_SELECT, selectEnrichedMessage, memberRole, validReplyTarget, insertTextMessage, UUID_RE,
 };

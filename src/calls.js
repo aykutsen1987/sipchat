@@ -7,6 +7,8 @@ const { sendPushToUser } = require('./push');
 const RING_TIMEOUT_MS = Number(process.env.CALL_RING_TIMEOUT_MS) || 45_000;
 const MAX_BUFFERED_ICE = 60;
 const MAX_GROUP_PARTICIPANTS = 6;
+// Görüntülü grup aramasında her kişi diğerlerine ayrı video gönderir (mesh); bant genişliği için daha düşük sınır.
+const MAX_GROUP_VIDEO_PARTICIPANTS = 4;
 
 // ---------------------------------------------------------------------------
 // 1:1 — bekleyen davet (çalma süresi boyunca). Aranan o sırada çevrimdışıysa ya da
@@ -59,11 +61,11 @@ function replayPendingInvite(socket) {
 }
 
 // ---------------------------------------------------------------------------
-// Grup araması: tam örgü (mesh) sesli arama. Her katılımcı diğerleriyle doğrudan
+// Grup araması: tam örgü (mesh) sesli ya da görüntülü arama. Her katılımcı diğerleriyle doğrudan
 // WebRTC bağlantısı kurar; sunucu yalnızca oda üyeliğini tutar ve sinyalleri iletir.
 // Yeni katılan herkes, odadaki mevcut katılımcılara teklif (offer) gönderir.
 // ---------------------------------------------------------------------------
-const groupCalls = new Map(); // chatId -> { chatId, title, startedAt, participants: Map(userId -> {handle, displayName}) }
+const groupCalls = new Map(); // chatId -> { chatId, title, video, startedAt, participants: Map(userId -> {handle, displayName}) }
 
 const publicParticipants = (room, exceptUserId) => [...room.participants.entries()]
   .filter(([id]) => id !== exceptUserId)
@@ -85,7 +87,7 @@ async function memberIdsOf(chatId) {
 }
 
 /** Oda yoksa oluşturur; kullanıcıyı ekler. Dönüş: { room, existing, created } ya da { error }. */
-async function joinGroupCall(io, userId, chatId) {
+async function joinGroupCall(io, userId, chatId, { video = false } = {}) {
   const info = await groupInfo(chatId, userId);
   if (!info) return { error: 'forbidden' };
   if (info.kind !== 'GROUP') return { error: 'not-a-group' };
@@ -93,10 +95,12 @@ async function joinGroupCall(io, userId, chatId) {
   let room = groupCalls.get(chatId);
   const created = !room;
   if (!room) {
-    room = { chatId, title: info.title, startedAt: Date.now(), participants: new Map() };
+    // Odayı kuran kişi türü belirler (sesli/görüntülü); sonradan katılanlar aynı türde katılır.
+    room = { chatId, title: info.title, video: video === true, startedAt: Date.now(), participants: new Map() };
     groupCalls.set(chatId, room);
   }
-  if (!room.participants.has(userId) && room.participants.size >= MAX_GROUP_PARTICIPANTS) return { error: 'full' };
+  const cap = room.video ? MAX_GROUP_VIDEO_PARTICIPANTS : MAX_GROUP_PARTICIPANTS;
+  if (!room.participants.has(userId) && room.participants.size >= cap) return { error: 'full' };
 
   const existing = publicParticipants(room, userId);
   const me = { userId, handle: info.handle, displayName: info.display_name };
@@ -109,9 +113,9 @@ async function joinGroupCall(io, userId, chatId) {
     // Diğer üyelere "grup araması çalıyor".
     const members = (await memberIdsOf(chatId)).filter((id) => id !== userId);
     members.forEach((id) => {
-      io.to(`user:${id}`).emit('gcall:ringing', { chatId, title: info.title, fromUserId: userId, fromHandle: info.handle, fromName: info.display_name });
+      io.to(`user:${id}`).emit('gcall:ringing', { chatId, title: info.title, video: room.video, fromUserId: userId, fromHandle: info.handle, fromName: info.display_name });
       if (!isOnline(io, id)) {
-        sendPushToUser(id, { title: info.title, body: `${info.display_name} grup araması başlattı` });
+        sendPushToUser(id, { title: info.title, body: room.video ? `${info.display_name} görüntülü grup araması başlattı` : `${info.display_name} grup araması başlattı` });
       }
     });
   }
@@ -158,12 +162,12 @@ async function replayGroupRinging(socket) {
     const room = groupCalls.get(chatId);
     if (!room || room.participants.has(socket.userId)) return;
     const first = [...room.participants.entries()][0];
-    socket.emit('gcall:ringing', { chatId, title: room.title, fromUserId: first?.[0], fromHandle: first?.[1].handle, fromName: first?.[1].displayName });
+    socket.emit('gcall:ringing', { chatId, title: room.title, video: room.video, fromUserId: first?.[0], fromHandle: first?.[1].handle, fromName: first?.[1].displayName });
   });
 }
 
 module.exports = {
   registerInvite, clearPendingBetween, bufferIce, replayPendingInvite,
   joinGroupCall, leaveGroupCall, leaveAllGroupCalls, relayGroupSignal, replayGroupRinging,
-  publicParticipants, MAX_GROUP_PARTICIPANTS,
+  publicParticipants, MAX_GROUP_PARTICIPANTS, MAX_GROUP_VIDEO_PARTICIPANTS,
 };

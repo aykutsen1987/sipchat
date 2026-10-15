@@ -223,3 +223,61 @@ CREATE INDEX IF NOT EXISTS idx_contact_hashes_hash ON contact_hashes(hash);
 -- Google ile açılan hesapların bilinen bir parolası yoktur (rastgele özet); silme gibi hassas işlemlerde
 -- parola yerine taze bir Google doğrulaması istenir.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS has_password BOOLEAN NOT NULL DEFAULT true;
+
+-- ---------------------------------------------------------------------------
+-- Parola sıfırlama (kurtarma anahtarı), mesaj yanıt/iletme/düzenleme,
+-- grup yöneticileri + grup fotoğrafı, şikayetler
+-- ---------------------------------------------------------------------------
+
+-- Kurtarma anahtarı: kayıtta bir kez gösterilir; yalnızca anahtarlı özeti (HMAC) saklanır.
+-- Parolasını unutan kullanıcı bu anahtarla (ücretsiz, e-posta/SMS gerektirmeden) parolasını yeniler.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_hash TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_created_at TIMESTAMPTZ;
+
+-- Parola sıfırlama kaba kuvvet kilidi (2FA kilidiyle aynı mantık, ayrı sayaç).
+CREATE TABLE IF NOT EXISTS password_reset_attempts (
+    user_id       UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    fail_count    INTEGER NOT NULL DEFAULT 0,
+    locked_until  TIMESTAMPTZ,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Yanıtla / ilet / düzenle.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id UUID REFERENCES messages(id) ON DELETE SET NULL;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded BOOLEAN NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to_id) WHERE reply_to_id IS NOT NULL;
+
+-- Grup yöneticileri ve grup fotoğrafı.
+ALTER TABLE chat_members ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'MEMBER'; -- ADMIN | MEMBER
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS photo_data BYTEA;
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS photo_mime TEXT;
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS photo_url TEXT;
+
+-- Yöneticisi olmayan mevcut gruplarda en eski üye yönetici olur (tekrar çalıştırmak zararsızdır).
+UPDATE chat_members cm SET role = 'ADMIN'
+ WHERE cm.role = 'MEMBER'
+   AND cm.chat_id IN (SELECT id FROM chats WHERE kind = 'GROUP')
+   AND NOT EXISTS (SELECT 1 FROM chat_members a WHERE a.chat_id = cm.chat_id AND a.role = 'ADMIN')
+   AND cm.user_id = (SELECT f.user_id FROM chat_members f WHERE f.chat_id = cm.chat_id ORDER BY f.joined_at, f.user_id LIMIT 1);
+
+-- Şikayetler (kullanıcı ya da mesaj). Mesaj silinse bile kanıt kalsın diye anlık görüntü saklanır.
+CREATE TABLE IF NOT EXISTS reports (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    reporter_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_user_id   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    chat_id          UUID REFERENCES chats(id) ON DELETE SET NULL,
+    message_id       UUID,
+    reason           TEXT NOT NULL,
+    details          TEXT,
+    snapshot         JSONB,
+    evidence_media   BYTEA,
+    evidence_mime    TEXT,
+    status           TEXT NOT NULL DEFAULT 'OPEN',   -- OPEN | DISMISSED | ACTIONED
+    resolution       TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reports_reporter ON reports(reporter_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reports_target ON reports(target_user_id);

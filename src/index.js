@@ -10,6 +10,7 @@ const { Server } = require('socket.io');
 const authRoutes = require('./routes/auth.routes');
 const chatsRoutes = require('./routes/chats.routes');
 const mediaRoutes = require('./routes/media.routes');
+const reportsRoutes = require('./routes/reports.routes');
 const usersRoutes = require('./routes/users.routes');
 const pushRoutes = require('./routes/push.routes');
 const sessionsRoutes = require('./routes/sessions.routes');
@@ -51,7 +52,7 @@ app.use(
 // stuffing / brute-force attempts.
 app.use(
   '/api/auth',
-  rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false }),
+  rateLimit({ windowMs: 15 * 60 * 1000, max: Number(process.env.AUTH_RATE_LIMIT_MAX) || 20, standardHeaders: true, legacyHeaders: false }),
 );
 
 // --- Routes ----------------------------------------------------------------
@@ -59,6 +60,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 app.use('/api/auth', authRoutes);
 app.use('/api/chats', chatsRoutes);
 app.use('/api/media', mediaRoutes);
+app.use('/api/reports', reportsRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/push', pushRoutes);
 app.use('/api/sessions', sessionsRoutes);

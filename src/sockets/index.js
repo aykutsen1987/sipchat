@@ -3,7 +3,7 @@ const { pool } = require('../db');
 const { sendPushToUser } = require('../push');
 const callState = require('../calls');
 const {
-  memberIds, isOnline, emitToMembers, contactIds, isChatBlocked, getShowLastSeen, selectEnrichedMessage,
+  memberIds, isOnline, emitToMembers, contactIds, isChatBlocked, getShowLastSeen, insertTextMessage,
 } = require('../realtime');
 
 /**
@@ -47,18 +47,18 @@ function attachSockets(io) {
 
     socket.on('message:send', async (payload, ack) => {
       try {
-        const { chatId, text } = payload || {};
+        const { chatId, text, replyToId, forwarded } = payload || {};
         if (!chatId || !text || typeof text !== 'string' || text.length > 8000) {
           return ack?.({ ok: false, error: 'invalid payload' });
         }
         if (!(await assertMember(chatId, socket.userId))) return ack?.({ ok: false, error: 'forbidden' });
         if (await isChatBlocked(chatId, socket.userId)) return ack?.({ ok: false, error: 'blocked' });
 
-        const inserted = await pool.query(
-          `INSERT INTO messages (chat_id, sender_id, type, text) VALUES ($1, $2, 'TEXT', $3) RETURNING id`,
-          [chatId, socket.userId, text],
-        );
-        const message = await selectEnrichedMessage(inserted.rows[0].id);
+        const result = await insertTextMessage({
+          chatId, senderId: socket.userId, text, replyToId: typeof replyToId === 'string' ? replyToId : null, forwarded: forwarded === true,
+        });
+        if (result.error) return ack?.({ ok: false, error: result.error });
+        const { message } = result;
         await emitToMembers(io, chatId, 'message:new', message);
         ack?.({ ok: true, message });
         notifyOtherMembers(io, chatId, socket.userId, message);
@@ -109,12 +109,15 @@ function attachSockets(io) {
     });
 
     // --- Grup araması (mesh, sesli): başlat/katıl, ayrıl, sinyal ilet ---
-    socket.on('gcall:join', async ({ chatId } = {}, ack) => {
+    socket.on('gcall:join', async ({ chatId, video } = {}, ack) => {
       try {
         if (typeof chatId !== 'string') return ack?.({ ok: false, error: 'invalid' });
-        const result = await callState.joinGroupCall(io, socket.userId, chatId);
+        const result = await callState.joinGroupCall(io, socket.userId, chatId, { video: video === true });
         if (result.error) return ack?.({ ok: false, error: result.error });
-        return ack?.({ ok: true, created: result.created, participants: result.existing, max: callState.MAX_GROUP_PARTICIPANTS });
+        return ack?.({
+          ok: true, created: result.created, participants: result.existing, video: result.room.video,
+          max: result.room.video ? callState.MAX_GROUP_VIDEO_PARTICIPANTS : callState.MAX_GROUP_PARTICIPANTS,
+        });
       } catch (err) {
         console.error('gcall:join error', err);
         return ack?.({ ok: false, error: 'server error' });

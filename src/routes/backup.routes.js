@@ -8,7 +8,8 @@ router.use(requireAuth);
 // The body is an opaque blob the CLIENT already encrypted (AES-256-GCM with a
 // key derived from the user's backup password) — the server never sees the
 // password or any plaintext. One slot per user; a new upload replaces the old.
-const MAX_BACKUP_BYTES = 10 * 1024 * 1024;
+// 64 MB: sohbet geçmişi + (isteğe bağlı) medya dosyaları. Daha büyük yedekler dosya olarak alınır.
+const MAX_BACKUP_BYTES = 64 * 1024 * 1024;
 
 // PUT /api/backup — raw bytes (Content-Type: application/octet-stream).
 router.put(

@@ -65,7 +65,7 @@ router.delete('/users/:idOrHandle', async (req, res) => {
   try {
     const user = await admin.findUserByHandleOrId(req.params.idOrHandle);
     if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı.' });
-    const result = await admin.deleteUsers([user.id]);
+    const result = await admin.deleteUsers([user.id], req.app.get('io'));
     res.json({ handle: user.handle, ...result });
   } catch (err) {
     console.error('admin delete user error', err);
@@ -90,11 +90,67 @@ router.post('/users/purge-inactive', async (req, res) => {
     if (dryRun) {
       return res.json({ dryRun: true, days, wouldDelete: users.length, users });
     }
-    const result = await admin.deleteUsers(users.map((u) => u.id));
+    const result = await admin.deleteUsers(users.map((u) => u.id), req.app.get('io'));
     return res.json({ dryRun: false, days, ...result, handles: users.map((u) => u.handle) });
   } catch (err) {
     console.error('admin purge error', err);
     return res.status(500).json({ error: 'Temizlik başarısız.' });
+  }
+});
+
+// GET /api/admin/reports?status=OPEN|DISMISSED|ACTIONED|ALL&limit=100&offset=0
+router.get('/reports', async (req, res) => {
+  try {
+    const status = ['OPEN', 'DISMISSED', 'ACTIONED', 'ALL'].includes(req.query.status) ? req.query.status : 'OPEN';
+    const reports = await admin.listReports({
+      status,
+      limit: toInt(req.query.limit, 100, 1, 500),
+      offset: toInt(req.query.offset, 0, 0, 1_000_000),
+    });
+    res.json({ count: reports.length, reports });
+  } catch (err) {
+    console.error('admin list reports error', err);
+    res.status(500).json({ error: 'Şikayetler alınamadı.' });
+  }
+});
+
+// GET /api/admin/reports/:id/media — şikayet edilen mesajın medyası (kanıt kopyası).
+router.get('/reports/:id/media', async (req, res) => {
+  if (!UUID.test(req.params.id)) return res.status(400).json({ error: 'Geçersiz id.' });
+  try {
+    const ev = await admin.getReportEvidence(req.params.id);
+    if (!ev || !ev.evidence_media) return res.status(404).json({ error: 'Kanıt medyası yok.' });
+    res.setHeader('Content-Type', ev.evidence_mime || 'application/octet-stream');
+    res.setHeader('Content-Disposition', 'attachment');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.send(ev.evidence_media);
+  } catch (err) {
+    console.error('admin report media error', err);
+    res.status(500).json({ error: 'Medya alınamadı.' });
+  }
+});
+
+// POST /api/admin/reports/:id/resolve {action: "DISMISS"|"REMOVE_MESSAGE"|"DELETE_USER", note?}
+router.post('/reports/:id/resolve', async (req, res) => {
+  if (!UUID.test(req.params.id)) return res.status(400).json({ error: 'Geçersiz id.' });
+  const action = req.body?.action;
+  if (!['DISMISS', 'REMOVE_MESSAGE', 'DELETE_USER'].includes(action)) {
+    return res.status(400).json({ error: 'action: DISMISS, REMOVE_MESSAGE veya DELETE_USER olmalı.' });
+  }
+  try {
+    const note = typeof req.body?.note === 'string' ? req.body.note.slice(0, 300) : '';
+    const result = await admin.resolveReport(req.params.id, action, note, req.app.get('io'));
+    if (!result) return res.status(404).json({ error: 'Şikayet bulunamadı.' });
+    if (result.removedMessage) {
+      const { emitToMembers } = require('../realtime');
+      await emitToMembers(req.app.get('io'), result.removedMessage.chat_id, 'message:deleted', {
+        chatId: result.removedMessage.chat_id, messageId: result.removedMessage.id,
+      }).catch(() => {});
+    }
+    res.json(result);
+  } catch (err) {
+    console.error('admin resolve report error', err);
+    res.status(500).json({ error: 'Şikayet sonuçlandırılamadı.' });
   }
 });
 

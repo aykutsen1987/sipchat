@@ -1,11 +1,12 @@
 const express = require('express');
 const multer = require('multer');
-const { body, param, validationResult } = require('express-validator');
+const { body, param, query, validationResult } = require('express-validator');
 const { pool } = require('../db');
 const { requireAuth } = require('../middleware/auth');
 const { notifyOtherMembers } = require('../sockets');
 const {
   isOnline, emitToMembers, isBlocked, isChatBlocked, MESSAGE_SELECT, selectEnrichedMessage,
+  memberRole, validReplyTarget, insertTextMessage, UUID_RE,
 } = require('../realtime');
 
 const router = express.Router();
@@ -19,6 +20,31 @@ const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_MEDIA_BYTES } });
 
 const invalid = (req) => !validationResult(req).isEmpty();
+
+// Mesajı yazdıktan sonra bu süre içinde düzenlenebilir.
+const EDIT_WINDOW_MS = 15 * 60 * 1000;
+
+// Grup fotoğrafı: istemci küçültür; sunucu tarafında 2 MB üst sınır + gerçek tür kontrolü.
+const MAX_PHOTO_BYTES = 2 * 1024 * 1024;
+const photoUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_PHOTO_BYTES } });
+
+function sniffImageMime(buf) {
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  return null;
+}
+
+/** Grup mı, yönetici miyim? Dönüş: { ok: true } ya da { status, error }. */
+async function requireGroupAdmin(chatId, userId) {
+  const chat = await pool.query('SELECT kind FROM chats WHERE id = $1', [chatId]);
+  if (chat.rows.length === 0) return { status: 404, error: 'Sohbet bulunamadı.' };
+  if (chat.rows[0].kind !== 'GROUP') return { status: 400, error: 'Bu işlem yalnızca gruplar için geçerli.' };
+  const role = await memberRole(chatId, userId);
+  if (!role) return { status: 403, error: 'Bu sohbete erişiminiz yok.' };
+  if (role !== 'ADMIN') return { status: 403, error: 'Bu işlem için grup yöneticisi olmalısınız.' };
+  return { ok: true };
+}
 
 async function assertMember(chatId, userId) {
   const r = await pool.query('SELECT 1 FROM chat_members WHERE chat_id = $1 AND user_id = $2', [chatId, userId]);
@@ -34,7 +60,7 @@ router.get('/', async (req, res) => {
               CASE WHEN c.kind = 'DIRECT' THEN COALESCE(peer.display_name, c.title) ELSE c.title END AS title,
               peer.id AS peer_user_id,
               COALESCE(peer_settings.show_last_seen, true) AS peer_show_last_seen,
-              c.disappear_seconds,
+              c.disappear_seconds, c.photo_url, cm.role AS my_role,
               m.text AS last_message_text, m.type AS last_message_type, m.created_at AS last_message_at,
               (SELECT COUNT(*) FROM messages um
                 WHERE um.chat_id = c.id AND um.sender_id != $1 AND um.created_at > cm.last_read_at)::int AS unread_count,
@@ -132,9 +158,11 @@ router.post(
         [type, title, disappearSeconds],
       );
       const chatId = chat.rows[0].id;
+      // Grubu kuran kişi yönetici olur (birebir sohbette rol anlamsızdır).
       await client.query(
-        'INSERT INTO chat_members (chat_id, user_id) SELECT $1, unnest($2::uuid[])',
-        [chatId, [me, ...others]],
+        `INSERT INTO chat_members (chat_id, user_id, role)
+         SELECT $1, u, CASE WHEN u = $3::uuid AND $4 = 'GROUP' THEN 'ADMIN' ELSE 'MEMBER' END FROM unnest($2::uuid[]) AS u`,
+        [chatId, [me, ...others], me, type],
       );
       await client.query('COMMIT');
 
@@ -151,39 +179,60 @@ router.post(
   },
 );
 
-// GET /api/chats/:chatId/messages — oldest→newest.
-router.get('/:chatId/messages', [param('chatId').isUUID()], async (req, res) => {
-  if (invalid(req)) return res.status(400).json({ error: 'Geçersiz chatId.' });
-  const { chatId } = req.params;
-  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
-  try {
-    if (!(await assertMember(chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
-    const result = await pool.query(
-      `${MESSAGE_SELECT} WHERE m.chat_id = $1 ORDER BY m.created_at DESC LIMIT $2`,
-      [chatId, limit],
-    );
-    res.json({ messages: result.rows.reverse() });
-  } catch (err) {
-    console.error('get messages error', err);
-    res.status(500).json({ error: 'Mesajlar getirilemedi.' });
-  }
-});
+// GET /api/chats/:chatId/messages?limit=50&before=<ISO tarih> — oldest→newest.
+// "before" verilirse yalnızca o andan ESKİ mesajlar gelir (yukarı kaydırınca eski mesajları yüklemek için);
+// hasMore: daha eski mesaj var mı. (Milisaniye sınırında tekrar gelen mesaj istemcide id ile birleşir.)
+router.get(
+  '/:chatId/messages',
+  [param('chatId').isUUID(), query('before').optional().isISO8601(), query('limit').optional().isInt({ min: 1, max: 200 })],
+  async (req, res) => {
+    if (invalid(req)) return res.status(400).json({ error: 'Geçersiz istek.' });
+    const { chatId } = req.params;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const before = req.query.before || null;
+    try {
+      if (!(await assertMember(chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
+      const params = [chatId, limit + 1];
+      let beforeSql = '';
+      if (before) {
+        params.push(before);
+        beforeSql = "AND m.created_at < ($3::timestamptz + interval '1 millisecond')";
+      }
+      const result = await pool.query(
+        `${MESSAGE_SELECT} WHERE m.chat_id = $1 ${beforeSql} ORDER BY m.created_at DESC LIMIT $2`,
+        params,
+      );
+      const hasMore = result.rows.length > limit;
+      const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
+      res.json({ messages: rows.reverse(), hasMore });
+    } catch (err) {
+      console.error('get messages error', err);
+      res.status(500).json({ error: 'Mesajlar getirilemedi.' });
+    }
+  },
+);
 
 // POST /api/chats/:chatId/messages — REST send (used when the socket is down).
+// Opsiyonel: replyToId (aynı sohbetteki bir mesaja yanıt), forwarded (iletilmiş mesaj işareti).
 router.post(
   '/:chatId/messages',
-  [param('chatId').isUUID(), body('text').isString().isLength({ min: 1, max: 8000 })],
+  [
+    param('chatId').isUUID(),
+    body('text').isString().isLength({ min: 1, max: 8000 }),
+    body('replyToId').optional({ nullable: true }).isUUID(),
+    body('forwarded').optional().isBoolean(),
+  ],
   async (req, res) => {
     if (invalid(req)) return res.status(400).json({ error: 'Geçersiz istek.' });
     const { chatId } = req.params;
     try {
       if (!(await assertMember(chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
       if (await isChatBlocked(chatId, req.user.id)) return res.status(403).json({ error: 'Bu kişiyle mesajlaşamazsınız.' });
-      const inserted = await pool.query(
-        `INSERT INTO messages (chat_id, sender_id, type, text) VALUES ($1, $2, 'TEXT', $3) RETURNING id`,
-        [chatId, req.user.id, req.body.text],
-      );
-      const message = await selectEnrichedMessage(inserted.rows[0].id);
+      const result = await insertTextMessage({
+        chatId, senderId: req.user.id, text: req.body.text, replyToId: req.body.replyToId || null, forwarded: req.body.forwarded === true,
+      });
+      if (result.error) return res.status(400).json({ error: 'Yanıtlanan mesaj bulunamadı.' });
+      const { message } = result;
       const io = req.app.get('io');
       await emitToMembers(io, chatId, 'message:new', message);
       notifyOtherMembers(io, chatId, req.user.id, message);
@@ -191,6 +240,72 @@ router.post(
     } catch (err) {
       console.error('post message error', err);
       res.status(500).json({ error: 'Mesaj gönderilemedi.' });
+    }
+  },
+);
+
+// PATCH /api/chats/:chatId/messages/:messageId {text} — kendi METİN mesajımı düzenle (15 dk içinde).
+// Birebir sohbetlerde metin uçtan uca şifrelidir: istemci yeni metni de şifreleyip gönderir.
+router.patch(
+  '/:chatId/messages/:messageId',
+  [param('chatId').isUUID(), param('messageId').isUUID(), body('text').isString().isLength({ min: 1, max: 8000 })],
+  async (req, res) => {
+    if (invalid(req)) return res.status(400).json({ error: 'Geçersiz istek.' });
+    const { chatId, messageId } = req.params;
+    try {
+      if (!(await assertMember(chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
+      if (await isChatBlocked(chatId, req.user.id)) return res.status(403).json({ error: 'Bu kişiyle mesajlaşamazsınız.' });
+      const found = await pool.query(
+        'SELECT sender_id, type, created_at FROM messages WHERE id = $1 AND chat_id = $2',
+        [messageId, chatId],
+      );
+      const row = found.rows[0];
+      if (!row || row.sender_id !== req.user.id) return res.status(404).json({ error: 'Mesaj bulunamadı veya size ait değil.' });
+      if (row.type !== 'TEXT') return res.status(400).json({ error: 'Yalnızca metin mesajları düzenlenebilir.' });
+      if (Date.now() - new Date(row.created_at).getTime() > EDIT_WINDOW_MS) {
+        return res.status(403).json({ error: 'Mesaj yalnızca gönderildikten sonraki 15 dakika içinde düzenlenebilir.' });
+      }
+      await pool.query('UPDATE messages SET text = $3, edited_at = now() WHERE id = $1 AND chat_id = $2', [messageId, chatId, req.body.text]);
+      const message = await selectEnrichedMessage(messageId);
+      await emitToMembers(req.app.get('io'), chatId, 'message:edited', message);
+      res.json({ message });
+    } catch (err) {
+      console.error('edit message error', err);
+      res.status(500).json({ error: 'Mesaj düzenlenemedi.' });
+    }
+  },
+);
+
+// POST /api/chats/:chatId/forward {sourceChatId, messageId} — bir MEDYA mesajını (fotoğraf/video/dosya/ses)
+// başka sohbete iletir: baytlar sunucuda kopyalanır, istemci yeniden yüklemez. Metin mesajlarını istemci,
+// çözdükten sonra normal gönderimle ("forwarded": true) iletir (birebir metin şifreli olduğundan sunucu kopyalayamaz).
+router.post(
+  '/:chatId/forward',
+  [param('chatId').isUUID(), body('sourceChatId').isUUID(), body('messageId').isUUID()],
+  async (req, res) => {
+    if (invalid(req)) return res.status(400).json({ error: 'Geçersiz istek.' });
+    const { chatId } = req.params;
+    const { sourceChatId, messageId } = req.body;
+    try {
+      if (!(await assertMember(chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
+      if (!(await assertMember(sourceChatId, req.user.id))) return res.status(403).json({ error: 'Kaynak sohbete erişiminiz yok.' });
+      if (await isChatBlocked(chatId, req.user.id)) return res.status(403).json({ error: 'Bu kişiyle mesajlaşamazsınız.' });
+      const inserted = await pool.query(
+        `INSERT INTO messages (chat_id, sender_id, type, text, media_data, media_mime, media_filename, forwarded)
+         SELECT $1, $2, type, text, media_data, media_mime, media_filename, true
+           FROM messages WHERE id = $3 AND chat_id = $4 AND media_data IS NOT NULL
+         RETURNING id`,
+        [chatId, req.user.id, messageId, sourceChatId],
+      );
+      if (inserted.rows.length === 0) return res.status(404).json({ error: 'İletilecek medya mesajı bulunamadı.' });
+      const message = await selectEnrichedMessage(inserted.rows[0].id);
+      const io = req.app.get('io');
+      await emitToMembers(io, chatId, 'message:new', message);
+      notifyOtherMembers(io, chatId, req.user.id, message);
+      res.status(201).json({ message });
+    } catch (err) {
+      console.error('forward error', err);
+      res.status(500).json({ error: 'Mesaj iletilemedi.' });
     }
   },
 );
@@ -211,11 +326,15 @@ router.post('/:chatId/media', [param('chatId').isUUID()], upload.single('file'),
       : mime.startsWith('video/') ? 'VIDEO'
         : mime.startsWith('audio/') ? 'VOICE' : 'FILE';
     const duration = type === 'VOICE' && typeof req.body.duration === 'string' ? req.body.duration.slice(0, 10) : null;
+    const replyToId = typeof req.body.replyToId === 'string' && UUID_RE.test(req.body.replyToId) ? req.body.replyToId : null;
+    if (replyToId && !(await validReplyTarget(chatId, replyToId))) {
+      return res.status(400).json({ error: 'Yanıtlanan mesaj bulunamadı.' });
+    }
 
     const inserted = await pool.query(
-      `INSERT INTO messages (chat_id, sender_id, type, text, media_data, media_mime, media_filename)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [chatId, req.user.id, type, duration, req.file.buffer, mime, req.file.originalname],
+      `INSERT INTO messages (chat_id, sender_id, type, text, media_data, media_mime, media_filename, reply_to_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+      [chatId, req.user.id, type, duration, req.file.buffer, mime, req.file.originalname, replyToId],
     );
     const message = await selectEnrichedMessage(inserted.rows[0].id);
     const io = req.app.get('io');
@@ -296,14 +415,16 @@ router.get('/:chatId/members', [param('chatId').isUUID()], async (req, res) => {
   try {
     if (!(await assertMember(req.params.chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
     const r = await pool.query(
-      `SELECT u.id, u.handle, u.display_name, u.avatar_url
+      `SELECT u.id, u.handle, u.display_name, u.avatar_url, cm.role
          FROM chat_members cm JOIN users u ON u.id = cm.user_id
         WHERE cm.chat_id = $1
-        ORDER BY cm.joined_at`,
+        ORDER BY (cm.role = 'ADMIN') DESC, cm.joined_at`,
       [req.params.chatId],
     );
     res.json({
-      members: r.rows.map((u) => ({ id: u.id, handle: u.handle, displayName: u.display_name, avatarUrl: u.avatar_url })),
+      members: r.rows.map((u) => ({
+        id: u.id, handle: u.handle, displayName: u.display_name, avatarUrl: u.avatar_url, role: u.role, isAdmin: u.role === 'ADMIN',
+      })),
     });
   } catch (err) {
     console.error('get members error', err);
@@ -311,8 +432,7 @@ router.get('/:chatId/members', [param('chatId').isUUID()], async (req, res) => {
   }
 });
 
-// POST /api/chats/:chatId/members — add people to a GROUP. Any current
-// member can invite others (no admin-only restriction in this MVP).
+// POST /api/chats/:chatId/members — add people to a GROUP. Yalnızca grup yöneticileri üye ekleyebilir.
 router.post(
   '/:chatId/members',
   [param('chatId').isUUID(), body('memberIds').isArray({ min: 1, max: 50 }), body('memberIds.*').isUUID()],
@@ -320,10 +440,8 @@ router.post(
     if (invalid(req)) return res.status(400).json({ error: 'Geçersiz istek.' });
     const { chatId } = req.params;
     try {
-      if (!(await assertMember(chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
-      const chat = await pool.query('SELECT kind FROM chats WHERE id = $1', [chatId]);
-      if (chat.rows.length === 0) return res.status(404).json({ error: 'Sohbet bulunamadı.' });
-      if (chat.rows[0].kind !== 'GROUP') return res.status(400).json({ error: 'Yalnızca gruplara üye eklenebilir.' });
+      const gate = await requireGroupAdmin(chatId, req.user.id);
+      if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
 
       const newIds = [...new Set(req.body.memberIds)];
       const found = await pool.query('SELECT id FROM users WHERE id = ANY($1)', [newIds]);
@@ -344,8 +462,8 @@ router.post(
   },
 );
 
-// DELETE /api/chats/:chatId/members/me — leave a group. (Leaving, not
-// removing others — no admin roles in this MVP; see README.md "Bilinen sınırlar".)
+// DELETE /api/chats/:chatId/members/me — gruptan ayrıl. Son yönetici ayrılırsa en eski üye yönetici olur;
+// kimse kalmazsa grup silinir.
 router.delete('/:chatId/members/me', [param('chatId').isUUID()], async (req, res) => {
   if (invalid(req)) return res.status(400).json({ error: 'Geçersiz chatId.' });
   const { chatId } = req.params;
@@ -358,12 +476,173 @@ router.delete('/:chatId/members/me', [param('chatId').isUUID()], async (req, res
     if (r.rowCount === 0) return res.status(403).json({ error: 'Bu sohbete zaten üye değilsiniz.' });
 
     const io = req.app.get('io');
-    await emitToMembers(io, chatId, 'chat:members-changed', { chatId });
+    const left = await pool.query('SELECT COUNT(*)::int AS n FROM chat_members WHERE chat_id = $1', [chatId]);
+    if (left.rows[0].n === 0) {
+      await pool.query('DELETE FROM chats WHERE id = $1', [chatId]);
+    } else {
+      await pool.query(
+        `UPDATE chat_members SET role = 'ADMIN'
+          WHERE chat_id = $1
+            AND NOT EXISTS (SELECT 1 FROM chat_members a WHERE a.chat_id = $1 AND a.role = 'ADMIN')
+            AND user_id = (SELECT user_id FROM chat_members WHERE chat_id = $1 ORDER BY joined_at, user_id LIMIT 1)`,
+        [chatId],
+      );
+      await emitToMembers(io, chatId, 'chat:members-changed', { chatId });
+    }
     io?.to(`user:${req.user.id}`).emit('chat:left', { chatId });
     res.status(204).send();
   } catch (err) {
     console.error('leave group error', err);
     res.status(500).json({ error: 'Gruptan ayrılınamadı.' });
+  }
+});
+
+// DELETE /api/chats/:chatId — sohbeti BENDEN sil. Birebir sohbette üyeliğim kalkar (karşı tarafın kopyası durur;
+// kimse kalmazsa sohbet tamamen silinir). Gruplarda "Gruptan ayrıl" aynı işi görür.
+router.delete('/:chatId', [param('chatId').isUUID()], async (req, res) => {
+  if (invalid(req)) return res.status(400).json({ error: 'Geçersiz chatId.' });
+  const { chatId } = req.params;
+  try {
+    const chat = await pool.query('SELECT kind FROM chats WHERE id = $1', [chatId]);
+    if (chat.rows.length === 0) return res.status(404).json({ error: 'Sohbet bulunamadı.' });
+    if (chat.rows[0].kind !== 'DIRECT') return res.status(400).json({ error: 'Gruplardan "Gruptan ayrıl" ile çıkılır.' });
+    const r = await pool.query('DELETE FROM chat_members WHERE chat_id = $1 AND user_id = $2', [chatId, req.user.id]);
+    if (r.rowCount === 0) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
+    const left = await pool.query('SELECT COUNT(*)::int AS n FROM chat_members WHERE chat_id = $1', [chatId]);
+    if (left.rows[0].n === 0) await pool.query('DELETE FROM chats WHERE id = $1', [chatId]);
+    req.app.get('io')?.to(`user:${req.user.id}`).emit('chat:left', { chatId });
+    res.status(204).send();
+  } catch (err) {
+    console.error('delete chat error', err);
+    res.status(500).json({ error: 'Sohbet silinemedi.' });
+  }
+});
+
+// DELETE /api/chats/:chatId/members/:userId — yönetici, bir üyeyi gruptan çıkarır.
+// Yöneticiler doğrudan çıkarılamaz: önce yöneticilikleri kaldırılmalı.
+router.delete('/:chatId/members/:userId', [param('chatId').isUUID(), param('userId').isUUID()], async (req, res) => {
+  if (invalid(req)) return res.status(400).json({ error: 'Geçersiz istek.' });
+  const { chatId, userId } = req.params;
+  try {
+    const gate = await requireGroupAdmin(chatId, req.user.id);
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+    if (userId === req.user.id) return res.status(400).json({ error: 'Kendinizi çıkarmak için "Gruptan Ayrıl"ı kullanın.' });
+    const targetRole = await memberRole(chatId, userId);
+    if (!targetRole) return res.status(404).json({ error: 'Kullanıcı bu grubun üyesi değil.' });
+    if (targetRole === 'ADMIN') return res.status(409).json({ error: 'Bir yöneticiyi çıkarmadan önce yöneticiliğini kaldırın.' });
+
+    await pool.query('DELETE FROM chat_members WHERE chat_id = $1 AND user_id = $2', [chatId, userId]);
+    const io = req.app.get('io');
+    io?.to(`user:${userId}`).emit('chat:left', { chatId });
+    await emitToMembers(io, chatId, 'chat:members-changed', { chatId });
+    res.status(204).send();
+  } catch (err) {
+    console.error('remove member error', err);
+    res.status(500).json({ error: 'Üye çıkarılamadı.' });
+  }
+});
+
+// PUT /api/chats/:chatId/members/:userId/role {role: "ADMIN"|"MEMBER"} — yönetici atama / kaldırma.
+// Grupta her zaman en az bir yönetici kalır.
+router.put(
+  '/:chatId/members/:userId/role',
+  [param('chatId').isUUID(), param('userId').isUUID(), body('role').isIn(['ADMIN', 'MEMBER'])],
+  async (req, res) => {
+    if (invalid(req)) return res.status(400).json({ error: 'Geçersiz istek.' });
+    const { chatId, userId } = req.params;
+    const { role } = req.body;
+    try {
+      const gate = await requireGroupAdmin(chatId, req.user.id);
+      if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+      const targetRole = await memberRole(chatId, userId);
+      if (!targetRole) return res.status(404).json({ error: 'Kullanıcı bu grubun üyesi değil.' });
+      if (role === 'MEMBER' && targetRole === 'ADMIN') {
+        const admins = await pool.query("SELECT COUNT(*)::int AS n FROM chat_members WHERE chat_id = $1 AND role = 'ADMIN'", [chatId]);
+        if (admins.rows[0].n <= 1) return res.status(409).json({ error: 'Grupta en az bir yönetici kalmalı.' });
+      }
+      await pool.query('UPDATE chat_members SET role = $3 WHERE chat_id = $1 AND user_id = $2', [chatId, userId, role]);
+      await emitToMembers(req.app.get('io'), chatId, 'chat:members-changed', { chatId });
+      res.json({ userId, role });
+    } catch (err) {
+      console.error('set role error', err);
+      res.status(500).json({ error: 'Rol değiştirilemedi.' });
+    }
+  },
+);
+
+// PATCH /api/chats/:chatId {title} — grubu yeniden adlandır (yönetici).
+router.patch('/:chatId', [param('chatId').isUUID(), body('title').trim().isLength({ min: 1, max: 60 })], async (req, res) => {
+  if (invalid(req)) return res.status(400).json({ error: 'Geçersiz istek.' });
+  const { chatId } = req.params;
+  try {
+    const gate = await requireGroupAdmin(chatId, req.user.id);
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+    await pool.query('UPDATE chats SET title = $2 WHERE id = $1', [chatId, req.body.title]);
+    await emitToMembers(req.app.get('io'), chatId, 'chat:updated', { chatId });
+    res.json({ chatId, title: req.body.title });
+  } catch (err) {
+    console.error('rename group error', err);
+    res.status(500).json({ error: 'Grup adı değiştirilemedi.' });
+  }
+});
+
+// PUT /api/chats/:chatId/photo — grup fotoğrafı (multipart alan adı "file"; JPEG/PNG/WebP, ≤ 2 MB). Yönetici.
+router.put('/:chatId/photo', [param('chatId').isUUID()], (req, res, next) => {
+  photoUpload.single('file')(req, res, (err) => {
+    if (err) {
+      const tooBig = err.code === 'LIMIT_FILE_SIZE';
+      return res.status(tooBig ? 413 : 400).json({ error: tooBig ? 'Fotoğraf en fazla 2 MB olabilir.' : 'Yükleme başarısız.' });
+    }
+    return next();
+  });
+}, async (req, res) => {
+  if (invalid(req)) return res.status(400).json({ error: 'Geçersiz chatId.' });
+  if (!req.file) return res.status(400).json({ error: 'Dosya eksik (multipart alan adı: "file").' });
+  const mime = sniffImageMime(req.file.buffer);
+  if (!mime) return res.status(400).json({ error: 'Yalnızca JPEG, PNG veya WebP yüklenebilir.' });
+  const { chatId } = req.params;
+  try {
+    const gate = await requireGroupAdmin(chatId, req.user.id);
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+    const url = `${req.protocol}://${req.get('host')}/api/chats/${chatId}/photo?v=${Date.now()}`;
+    await pool.query('UPDATE chats SET photo_data = $2, photo_mime = $3, photo_url = $4 WHERE id = $1', [chatId, req.file.buffer, mime, url]);
+    await emitToMembers(req.app.get('io'), chatId, 'chat:updated', { chatId });
+    res.json({ chatId, photoUrl: url });
+  } catch (err) {
+    console.error('put group photo error', err);
+    res.status(500).json({ error: 'Fotoğraf kaydedilemedi.' });
+  }
+});
+
+// DELETE /api/chats/:chatId/photo — grup fotoğrafını kaldır (yönetici).
+router.delete('/:chatId/photo', [param('chatId').isUUID()], async (req, res) => {
+  if (invalid(req)) return res.status(400).json({ error: 'Geçersiz chatId.' });
+  const { chatId } = req.params;
+  try {
+    const gate = await requireGroupAdmin(chatId, req.user.id);
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+    await pool.query('UPDATE chats SET photo_data = NULL, photo_mime = NULL, photo_url = NULL WHERE id = $1', [chatId]);
+    await emitToMembers(req.app.get('io'), chatId, 'chat:updated', { chatId });
+    res.status(204).send();
+  } catch (err) {
+    console.error('delete group photo error', err);
+    res.status(500).json({ error: 'Fotoğraf kaldırılamadı.' });
+  }
+});
+
+// GET /api/chats/:chatId/photo — yalnızca grup üyeleri görebilir.
+router.get('/:chatId/photo', [param('chatId').isUUID()], async (req, res) => {
+  if (invalid(req)) return res.status(400).json({ error: 'Geçersiz chatId.' });
+  try {
+    if (!(await assertMember(req.params.chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
+    const r = await pool.query('SELECT photo_data, photo_mime FROM chats WHERE id = $1', [req.params.chatId]);
+    if (r.rows.length === 0 || !r.rows[0].photo_data) return res.status(404).json({ error: 'Fotoğraf yok.' });
+    res.setHeader('Content-Type', r.rows[0].photo_mime || 'image/jpeg');
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    res.send(r.rows[0].photo_data);
+  } catch (err) {
+    console.error('get group photo error', err);
+    res.status(500).json({ error: 'Fotoğraf getirilemedi.' });
   }
 });
 
