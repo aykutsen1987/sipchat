@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SipChat Yönetim</title>
+<style>
+  body{font-family:system-ui,sans-serif;margin:0;background:#12131a;color:#e6e6ee}
+  main{max-width:1000px;margin:0 auto;padding:16px}
+  h1{font-size:20px} input,button,select{font:inherit;padding:8px 10px;border-radius:8px;border:1px solid #444;background:#1d1f2a;color:inherit}
+  button{cursor:pointer} button.danger{background:#7a1f2b;border-color:#a33}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0;align-items:center}
+  table{width:100%;border-collapse:collapse;font-size:14px} th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #2a2c3a}
+  .wrap{overflow-x:auto} #msg{margin:8px 0;min-height:1.2em;color:#9fd}
+  .muted{color:#99a}
+</style>
+</head>
+<body>
+<main>
+  <h1>SipChat Yönetim</h1>
+  <p class="muted">Yönetici anahtarı yalnızca bu sekmede, bellekte tutulur; sayfayı kapatınca silinir.</p>
+  <div class="row">
+    <input id="key" type="password" placeholder="ADMIN_API_KEY" size="36" autocomplete="off">
+    <button id="stats">İstatistik</button>
+    <button id="reports">Şikayetler (açık)</button>
+    <button id="reportsAll">Tüm şikayetler</button>
+  </div>
+  <div class="row">
+    <label>Pasiflik (gün): <input id="days" type="number" min="1" placeholder="boş = herkes" style="width:130px"></label>
+    <button id="list">Kullanıcıları listele</button>
+    <button id="purgeDry">Toplu silme önizlemesi</button>
+    <button id="purgeReal" class="danger">Listelenen pasifleri SİL</button>
+  </div>
+  <div id="msg"></div>
+  <div class="wrap"><table id="tbl"></table></div>
+</main>
+<script src="/admin/app.js"></script>
+</body>
+</html>
