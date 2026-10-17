@@ -40,7 +40,7 @@ function tryInit() {
  * Sends a push to every device token registered for userId, best-effort.
  * Never throws — a push failure must never break message delivery.
  */
-async function sendPushToUser(userId, { title, body }) {
+async function sendPushToUser(userId, { title, body, data = {} }) {
   tryInit();
   if (!admin) return;
 
@@ -51,7 +51,10 @@ async function sendPushToUser(userId, { title, body }) {
 
     const response = await admin.messaging().sendEachForMulticast({
       tokens,
-      notification: { title, body },
+      // DATA-ONLY: uygulama bildirimi kendisi kurar (arka planda da onMessageReceived çalışır). Böylece bildirim
+      // sohbet kimliğiyle işaretlenir: dokununca doğrudan o sohbet açılır, sohbet açılınca bildirim silinebilir.
+      // Tüm değerler string olmalıdır.
+      data: { title: String(title ?? ''), body: String(body ?? ''), ...Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) },
       android: { priority: 'high' },
     });
 

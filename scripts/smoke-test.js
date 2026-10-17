@@ -28,7 +28,7 @@ async function call(method, path, { token, body, admin, raw } = {}) {
 
 const rand = Math.random().toString(36).slice(2, 8);
 async function register(name) {
-  const r = await call('POST', '/api/auth/register', { body: { handle: `${name}_${rand}`, displayName: name, password: 'password123' } });
+  const r = await call('POST', '/api/auth/register', { body: { handle: `${name}_${rand}`, displayName: name, password: 'password123', ageConfirmed: true } });
   return { ...r.json, handle: `${name}_${rand}`, status: r.status };
 }
 
@@ -40,6 +40,26 @@ function multipartFile(field, filename, mime, bytes) {
 }
 
 async function run() {
+  console.log('13 yaş onayı');
+  const noAge = await call('POST', '/api/auth/register', { body: { handle: `noage_${rand}`, displayName: 'x', password: 'password123' } });
+  check('register without the 13+ confirmation is refused', noAge.status === 400 && /13 yaş/.test(noAge.json.error), noAge.json);
+  const falseAge = await call('POST', '/api/auth/register', { body: { handle: `noage_${rand}`, displayName: 'x', password: 'password123', ageConfirmed: false } });
+  check('ageConfirmed=false is refused', falseAge.status === 400);
+  const strAge = await call('POST', '/api/auth/register', { body: { handle: `noage_${rand}`, displayName: 'x', password: 'password123', ageConfirmed: 'true' } });
+  check('a non-boolean "true" is refused too', strAge.status === 400);
+
+  const gNew = `test:${JSON.stringify({ sub: `agesub-${rand}`, email: `age_${rand}@example.com`, email_verified: true })}`;
+  const gStep1 = await call('POST', '/api/auth/google', { body: { idToken: gNew } });
+  check('google signup step 1 asks for a handle', gStep1.status === 200 && gStep1.json.needsHandle === true, gStep1.json);
+  const gNoAge = await call('POST', '/api/auth/google', { body: { idToken: gNew, handle: `gage_${rand}` } });
+  check('google signup without the 13+ confirmation is refused', gNoAge.status === 400 && gNoAge.json.ageRequired === true, gNoAge.json);
+  const gOk = await call('POST', '/api/auth/google', { body: { idToken: gNew, handle: `gage_${rand}`, ageConfirmed: true } });
+  check('google signup with the confirmation works', gOk.status === 201 && !!gOk.json.token, gOk.json);
+  const ac = await call('POST', '/api/auth/age-confirm', { token: gOk.json.token });
+  check('age-confirm endpoint (existing accounts)', ac.status === 204);
+  const acNo = await call('POST', '/api/auth/age-confirm', {});
+  check('age-confirm needs a session', acNo.status === 401);
+
   console.log('Kayıt + kurtarma anahtarı');
   const a = await register('alice');
   const b = await register('bob');

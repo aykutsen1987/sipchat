@@ -305,3 +305,7 @@ BEGIN
     ON CONFLICT DO NOTHING;
   END IF;
 END $$;
+
+-- SipChat 13 yaş ve üzeri içindir: kayıtta yaş beyanı zorunludur ve zamanı saklanır
+-- (eski hesaplar uygulamada bir kez onaylar: POST /api/auth/age-confirm).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS age_confirmed_at TIMESTAMPTZ;

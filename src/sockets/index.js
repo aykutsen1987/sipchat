@@ -43,6 +43,30 @@ function attachSockets(io) {
     // Kept for older clients; live delivery now goes through the personal
     // `user:<id>` room, so joining chat rooms is no longer required.
     socket.on('chat:join', () => {});
+
+    // "yazıyor…": {chatId, typing: boolean}. Kalıcı değildir; yalnızca çevrimiçi diğer üyelere aktarılır.
+    // Engellenmiş sohbette aktarılmaz. İstemci yazarken ~3 sn'de bir gönderir ve durunca typing:false yollar;
+    // alıcı 6 sn içinde yenisi gelmezse göstergeyi kendisi kapatır (bağlantı kopsa da takılı kalmaz).
+    socket.on('chat:typing', async (payload) => {
+      try {
+        const { chatId, typing } = payload || {};
+        if (!chatId || typeof chatId !== 'string') return;
+        if (!(await assertMember(chatId, socket.userId))) return;
+        if (await isChatBlocked(chatId, socket.userId)) return;
+        if (!socket.displayName) {
+          const u = await pool.query('SELECT display_name FROM users WHERE id = $1', [socket.userId]);
+          socket.displayName = u.rows[0]?.display_name || socket.userHandle;
+        }
+        const ids = await memberIds(chatId);
+        ids.filter((id) => id !== socket.userId).forEach((id) => {
+          io.to(`user:${id}`).emit('chat:typing', {
+            chatId, userId: socket.userId, name: socket.displayName, typing: typing === true,
+          });
+        });
+      } catch (err) {
+        console.error('typing error (non-fatal)', err);
+      }
+    });
     socket.on('chat:leave', () => {});
 
     socket.on('message:send', async (payload, ack) => {
@@ -197,6 +221,7 @@ async function notifyOtherMembers(io, chatId, senderId, message) {
       return sendPushToUser(id, {
         title: showPreview ? senderName : 'SipChat',
         body: showPreview ? fullBody : 'Yeni bir mesajınız var',
+        data: { chatId, type: 'message' },
       });
     }));
   } catch (err) {

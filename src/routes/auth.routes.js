@@ -12,6 +12,8 @@ const crypto = require('crypto');
 const { hashEmail } = require('../emailhash');
 const recovery = require('../recovery');
 
+const AGE_MESSAGE = 'SipChat 13 yaş ve üzeri içindir: hesap açmak için 13 yaşını doldurduğunuzu onaylamalısınız.';
+
 const router = express.Router();
 
 const HANDLE_REGEX = /^[a-z0-9_]{3,20}$/;
@@ -47,6 +49,8 @@ router.post(
     body('displayName').trim().isLength({ min: 1, max: 60 }),
     body('password').isLength({ min: 8, max: 128 }).withMessage('Şifre en az 8 karakter olmalı'),
     body('deviceName').optional().isString().isLength({ max: 120 }),
+    // SipChat 13 yaş ve üzeri içindir: beyan olmadan hesap açılmaz.
+    body('ageConfirmed').custom((v) => v === true).withMessage(AGE_MESSAGE),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -67,8 +71,8 @@ router.post(
       const passwordHash = await bcrypt.hash(password, 12);
 
       const result = await pool.query(
-        `INSERT INTO users (handle, display_name, password_hash)
-         VALUES ($1, $2, $3)
+        `INSERT INTO users (handle, display_name, password_hash, age_confirmed_at)
+         VALUES ($1, $2, $3, now())
          RETURNING id, handle, display_name, avatar_url`,
         [handle, displayName, passwordHash],
       );
@@ -277,6 +281,9 @@ router.post(
       }
 
       const handle = req.body.handle;
+      if (handle && req.body.ageConfirmed !== true) {
+        return res.status(400).json({ error: AGE_MESSAGE, ageRequired: true });
+      }
       if (!handle) {
         let suggested = suggestHandle(g.email, g.name);
         const clash = await pool.query('SELECT 1 FROM users WHERE handle = $1', [suggested]);
@@ -290,8 +297,8 @@ router.post(
       const randomHash = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10);
       const displayName = (req.body.displayName || g.name || handle).slice(0, 60);
       const created = await pool.query(
-        `INSERT INTO users (handle, display_name, password_hash, email, email_verified, google_sub, email_hash, has_password)
-         VALUES ($1, $2, $3, $4, true, $5, $6, false) RETURNING id, handle, display_name, avatar_url`,
+        `INSERT INTO users (handle, display_name, password_hash, email, email_verified, google_sub, email_hash, has_password, age_confirmed_at)
+         VALUES ($1, $2, $3, $4, true, $5, $6, false, now()) RETURNING id, handle, display_name, avatar_url`,
         [handle, displayName, randomHash, g.email.toLowerCase(), g.sub, hashEmail(g.email)],
       );
       const user = created.rows[0];
@@ -357,6 +364,17 @@ async function requireSecondFactorIfEnabled(userId, code) {
   if (check.locked) return { status: 429, body: { error: `Çok fazla hatalı deneme. ${check.retryAfterMin} dakika sonra tekrar deneyin.` } };
   return { status: 401, body: { error: 'Doğrulama kodu hatalı.', requiresTwoFactor: true } };
 }
+
+// POST /api/auth/age-confirm — mevcut (yaş beyanı olmayan) hesaplar için "13 yaşını doldurdum" onayı.
+router.post('/age-confirm', requireAuth, async (req, res) => {
+  try {
+    await pool.query('UPDATE users SET age_confirmed_at = COALESCE(age_confirmed_at, now()) WHERE id = $1', [req.user.id]);
+    return res.status(204).send();
+  } catch (err) {
+    console.error('age confirm error', err);
+    return res.status(500).json({ error: 'Onay kaydedilemedi.' });
+  }
+});
 
 // GET /api/auth/recovery-key/status — bu hesabın bir kurtarma anahtarı var mı?
 router.get('/recovery-key/status', requireAuth, async (req, res) => {
