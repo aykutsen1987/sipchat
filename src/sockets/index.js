@@ -72,7 +72,7 @@ function attachSockets(io) {
     socket.on('message:send', async (payload, ack) => {
       try {
         const { chatId, text, replyToId, forwarded } = payload || {};
-        if (!chatId || !text || typeof text !== 'string' || text.length > 8000) {
+        if (!chatId || !text || typeof text !== 'string' || text.length > 60000) {
           return ack?.({ ok: false, error: 'invalid payload' });
         }
         if (!(await assertMember(chatId, socket.userId))) return ack?.({ ok: false, error: 'forbidden' });

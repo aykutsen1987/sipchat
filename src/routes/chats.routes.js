@@ -21,6 +21,10 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX
 
 const invalid = (req) => !validationResult(req).isEmpty();
 
+// Metin (ya da birebir sohbette ŞİFRELİ metin) üst sınırı. Şifreli metin her cihaz anahtarı için ayrı bir kopya içerir
+// (çoklu cihaz), bu yüzden düz metinden birkaç kat uzundur.
+const MAX_TEXT_LENGTH = 60000;
+
 // Mesajı yazdıktan sonra bu süre içinde düzenlenebilir.
 const EDIT_WINDOW_MS = 15 * 60 * 1000;
 
@@ -231,7 +235,7 @@ router.post(
   '/:chatId/messages',
   [
     param('chatId').isUUID(),
-    body('text').isString().isLength({ min: 1, max: 8000 }),
+    body('text').isString().isLength({ min: 1, max: MAX_TEXT_LENGTH }),
     body('replyToId').optional({ nullable: true }).isUUID(),
     body('forwarded').optional().isBoolean(),
   ],
@@ -261,7 +265,7 @@ router.post(
 // Birebir sohbetlerde metin uçtan uca şifrelidir: istemci yeni metni de şifreleyip gönderir.
 router.patch(
   '/:chatId/messages/:messageId',
-  [param('chatId').isUUID(), param('messageId').isUUID(), body('text').isString().isLength({ min: 1, max: 8000 })],
+  [param('chatId').isUUID(), param('messageId').isUUID(), body('text').isString().isLength({ min: 1, max: MAX_TEXT_LENGTH })],
   async (req, res) => {
     if (invalid(req)) return res.status(400).json({ error: 'Geçersiz istek.' });
     const { chatId, messageId } = req.params;
@@ -661,7 +665,37 @@ router.get('/:chatId/photo', [param('chatId').isUUID()], async (req, res) => {
   }
 });
 
-// GET /api/chats/:chatId/peer-key — the other member's E2E public key (DIRECT only).
+// GET /api/chats/:chatId/keys — birebir sohbette şifrelemek için GEREKEN TÜM anahtarlar:
+//   peer: karşı tarafın tüm cihaz anahtarları, mine: benim tüm cihaz anahtarlarım (diğer cihazlarım da gönderdiğim
+//   mesajı okuyabilsin). Aynı anahtar tekrarlanmaz, en yeni önce.
+router.get('/:chatId/keys', [param('chatId').isUUID()], async (req, res) => {
+  if (invalid(req)) return res.status(400).json({ error: 'Geçersiz chatId.' });
+  try {
+    const chat = await pool.query('SELECT kind FROM chats WHERE id = $1', [req.params.chatId]);
+    if (chat.rows.length === 0) return res.status(404).json({ error: 'Sohbet bulunamadı.' });
+    if (chat.rows[0].kind !== 'DIRECT') return res.status(400).json({ error: 'keys yalnızca DIRECT sohbetler için geçerlidir.' });
+    if (!(await assertMember(req.params.chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
+
+    const rows = await pool.query(
+      `SELECT DISTINCT ON (k.user_id, k.public_key) k.user_id, k.device_id, k.public_key, k.updated_at
+         FROM chat_members cm JOIN user_device_keys k ON k.user_id = cm.user_id
+        WHERE cm.chat_id = $1
+        ORDER BY k.user_id, k.public_key, k.updated_at DESC`,
+      [req.params.chatId],
+    );
+    const byNewest = (a, b) => new Date(b.updated_at) - new Date(a.updated_at);
+    const shape = (r) => ({ deviceId: r.device_id, publicKey: r.public_key });
+    const peer = rows.rows.filter((r) => r.user_id !== req.user.id).sort(byNewest).map(shape);
+    const mine = rows.rows.filter((r) => r.user_id === req.user.id).sort(byNewest).map(shape);
+    if (peer.length === 0) return res.status(404).json({ error: 'Karşı tarafın henüz yayınlanmış bir anahtarı yok.' });
+    res.json({ peer, mine });
+  } catch (err) {
+    console.error('get keys error', err);
+    res.status(500).json({ error: 'Anahtarlar getirilemedi.' });
+  }
+});
+
+// GET /api/chats/:chatId/peer-key — (eski istemciler için) karşı tarafın EN SON anahtarı (DIRECT only).
 router.get('/:chatId/peer-key', [param('chatId').isUUID()], async (req, res) => {
   if (invalid(req)) return res.status(400).json({ error: 'Geçersiz chatId.' });
   try {
@@ -671,9 +705,10 @@ router.get('/:chatId/peer-key', [param('chatId').isUUID()], async (req, res) => 
     if (!(await assertMember(req.params.chatId, req.user.id))) return res.status(403).json({ error: 'Bu sohbete erişiminiz yok.' });
 
     const peer = await pool.query(
-      `SELECT uk.public_key, cm.user_id FROM chat_members cm
-         JOIN user_keys uk ON uk.user_id = cm.user_id
-        WHERE cm.chat_id = $1 AND cm.user_id != $2 LIMIT 1`,
+      `SELECT k.public_key, cm.user_id FROM chat_members cm
+         JOIN user_device_keys k ON k.user_id = cm.user_id
+        WHERE cm.chat_id = $1 AND cm.user_id != $2
+        ORDER BY k.updated_at DESC LIMIT 1`,
       [req.params.chatId, req.user.id],
     );
     if (peer.rows.length === 0) return res.status(404).json({ error: 'Karşı tarafın henüz yayınlanmış bir anahtarı yok.' });

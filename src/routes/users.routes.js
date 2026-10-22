@@ -30,17 +30,37 @@ const toPublicUser = (u) => ({ id: u.id, handle: u.handle, displayName: u.displa
 // the PUBLIC half — see Android's E2eKeyManager.kt.
 router.put(
   '/me/key',
-  [body('publicKey').isString().isLength({ min: 1, max: 20000 })],
+  [
+    body('publicKey').isString().isLength({ min: 1, max: 20000 }),
+    // Cihaz kimliği (istemci anahtarın özetinden türetir). Yoksa eski istemciler için 'legacy'.
+    body('deviceId').optional().matches(/^[A-Za-z0-9_-]{1,64}$/),
+  ],
   async (req, res) => {
     if (!validationResult(req).isEmpty()) {
       return res.status(400).json({ error: 'Geçersiz publicKey.' });
     }
     try {
+      const deviceId = req.body.deviceId || 'legacy';
+      await pool.query(
+        `INSERT INTO user_device_keys (user_id, device_id, public_key, updated_at)
+         VALUES ($1, $2, $3, now())
+         ON CONFLICT (user_id, device_id) DO UPDATE SET public_key = EXCLUDED.public_key, updated_at = now()`,
+        [req.user.id, deviceId, req.body.publicKey],
+      );
+      // Eski uçlar/istemciler için "en son yayınlanan anahtar" da güncel tutulur.
       await pool.query(
         `INSERT INTO user_keys (user_id, public_key, updated_at)
          VALUES ($1, $2, now())
          ON CONFLICT (user_id) DO UPDATE SET public_key = EXCLUDED.public_key, updated_at = now()`,
         [req.user.id, req.body.publicKey],
+      );
+      // Eskiyen/aşırı cihaz anahtarlarını buda: en yeni 6 cihaz kalır, 90 günden eskiler silinir.
+      await pool.query(
+        `DELETE FROM user_device_keys
+          WHERE user_id = $1
+            AND (updated_at < now() - interval '90 days'
+                 OR device_id NOT IN (SELECT device_id FROM user_device_keys WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 6))`,
+        [req.user.id],
       );
       res.status(204).send();
     } catch (err) {

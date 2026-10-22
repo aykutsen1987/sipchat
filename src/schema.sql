@@ -309,3 +309,23 @@ END $$;
 -- SipChat 13 yaş ve üzeri içindir: kayıtta yaş beyanı zorunludur ve zamanı saklanır
 -- (eski hesaplar uygulamada bir kez onaylar: POST /api/auth/age-confirm).
 ALTER TABLE users ADD COLUMN IF NOT EXISTS age_confirmed_at TIMESTAMPTZ;
+
+-- ---------------------------------------------------------------------------
+-- Çoklu cihaz E2E anahtarları: bir hesabın birden çok cihazı (telefon + emülatör, yeniden kurulum) olabilir ve
+-- her cihaz kendi anahtarını üretir. Eskiden hesap başına TEK anahtar tutulduğundan son giriş yapan cihaz
+-- diğerininkini eziyor, mesajlar yalnızca bir cihaza şifreleniyor ve diğer cihazda "şifresi çözülemedi"
+-- görünüyordu. Artık her cihazın anahtarı ayrı saklanır; gönderen mesajı tüm cihaz anahtarlarına şifreler.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS user_device_keys (
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id   TEXT NOT NULL,
+    public_key  TEXT NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, device_id)
+);
+CREATE INDEX IF NOT EXISTS idx_device_keys_user ON user_device_keys(user_id, updated_at DESC);
+-- Eski tek anahtarı bir kez taşı (yalnızca henüz hiç cihaz anahtarı olmayan kullanıcılar için).
+INSERT INTO user_device_keys (user_id, device_id, public_key, updated_at)
+SELECT uk.user_id, 'legacy', uk.public_key, uk.updated_at FROM user_keys uk
+ WHERE NOT EXISTS (SELECT 1 FROM user_device_keys d WHERE d.user_id = uk.user_id)
+ON CONFLICT DO NOTHING;
